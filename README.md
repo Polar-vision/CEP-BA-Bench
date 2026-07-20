@@ -7,8 +7,8 @@ PVL-BA-Bench-style datasets, and separates clean timing runs from heavier
 diagnostic exports.
 
 This repository contains the source code, benchmark driver, documentation, and
-analysis scripts. Large datasets, local build products, paper PDFs, and
-generated benchmark results are intentionally not versioned.
+analysis scripts. Large datasets, local build products, external reference
+material, and generated benchmark results are intentionally not versioned.
 
 ## What is included
 
@@ -149,7 +149,7 @@ Important options:
 
 ## Clean timing run
 
-Use clean mode for paper timing tables. It writes only the aggregate
+Use clean mode for runtime comparison tables. It writes only the aggregate
 `summary.csv` and disables diagnostic exports during the timed solve:
 
 ```powershell

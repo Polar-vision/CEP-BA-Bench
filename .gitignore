@@ -44,7 +44,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Papers and extracted reference text
+# External reference material and extracted text
 *.pdf
 *_extracted.txt
 docs/*_extracted.txt

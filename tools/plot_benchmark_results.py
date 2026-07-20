@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate paper-ready benchmark tables and figures from CEP outputs."""
+"""Generate benchmark tables and figures from CEP outputs."""
 
 from __future__ import annotations
 
