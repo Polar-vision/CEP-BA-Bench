@@ -18,7 +18,7 @@ primary runtime table.
 ## Metrics for the full benchmark
 
 The following metrics are inexpensive Ceres summary values and can be
-collected for all quality datasets:
+collected for all Initial Value problems:
 
 - execution status, Ceres termination status, and solution failure rate;
 - initial and final reprojection RMSE;
@@ -29,11 +29,11 @@ collected for all quality datasets:
 
 Execution success only means that the benchmark process returned normally.
 Ceres convergence additionally requires `termination_type == CONVERGENCE`.
-For matched runs on the same quality dataset, an equivalent solution requires
+For matched runs on the same benchmark problem, an equivalent solution requires
 both Ceres convergence and a final reprojection RMSE no more than 1% above the
 best final RMSE obtained by any compared method. The relative tolerance must
 be reported and sensitivity to this threshold should be checked in the final
-paper.
+analysis.
 
 For datasets containing independent check points, object-space RMSE should be
 reported separately from the reprojection metrics. GCPs used as constraints
@@ -54,12 +54,11 @@ several initial-error levels:
 
 These diagnostics must remain disabled in clean timing runs.
 
-All available quality levels should be included in the clean benchmark because
-low-error cases alone can hide differences in convergence basin and failure
-rate. Expensive diagnostics do not need to be run for every dataset in the
-full corpus. They should cover every quality level on a small representative
-set of base datasets, or at least low, medium, and high initial-error levels
-when the full cross-product is too expensive.
+All Initial Value problems should be included in the clean benchmark because
+small or easy cases alone can hide differences in convergence basin and failure
+rate. Expensive diagnostics can be run either for the full corpus or for a
+representative subset that covers the four scene categories and a range of
+problem sizes.
 
 The sampled Schur system is formed from a point-induced camera subgraph, so it
 usually contains a larger null space than the full BA system. Report its
@@ -81,7 +80,7 @@ Recommended main Results figures and tables:
 - success/failure rate by parameterization;
 - solver-time and linear-solver-time boxplots;
 - iteration-count and final-RMSE boxplots;
-- mean-rank plots across matched quality datasets;
+- mean-rank plots across matched Initial Value problems;
 - check-point object-space accuracy for datasets with independent checks;
 - a compact table of median performance and statistical ranks.
 
@@ -95,7 +94,7 @@ Recommended Discussion figures:
 
 ## Implemented methods
 
-The CEP runner exposes all 14 methods in the paper:
+The CEP runner exposes all 14 evaluated methods:
 
 - `A0-XYZ-W`
 - `A0-XYInvZ-W`

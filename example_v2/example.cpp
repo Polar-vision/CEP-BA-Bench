@@ -28,6 +28,13 @@ struct DatasetPaths {
     fs::path calib;
 };
 
+struct InputFiles {
+    fs::path cam;
+    fs::path feature;
+    fs::path xyz;
+    fs::path calib;
+};
+
 const char* summary_header() {
     return "base_dataset,quality_dataset,method,mode,status,wall_time_sec,"
            "solver_time_sec,linear_solver_time_sec,cameras,points,observations,"
@@ -108,14 +115,15 @@ bool output_mode_from_name(const std::string& name, BenchmarkOutputMode* mode) {
 
 void print_usage(const char* exe) {
     std::cout
-        << "Usage: " << exe << " [--problems <BA-problems>] [--out <results>]\n"
+        << "Usage: " << exe << " [--problems <input-root>] [--out <results>]\n"
         << "                  [--method <MethodId>] [--limit <N>] [--dataset <name>]\n"
         << "                  [--mode clean|diagnostic] [--resume]\n"
         << "                  [--no-xyz]\n"
         << "                  [--point-condition-sample <N>]\n"
         << "                  [--schur-sample <N>]\n"
         << "\n"
-        << "Only quality subdatasets are run. The original set is kept as reference.\n"
+        << "Input root may be a BA Datasets tree with Initial Value/Ground Truth\n"
+        << "folders, or a prepared original/quality benchmark tree.\n"
         << "Method IDs: A0-XYZ-W, A0-XYInvZ-W, A0-SphRange-W, A0-SphInvRange-W,\n"
         << "            A1-XYZ-Ac, A1-XYInvZ-Ac, A1-SphRange-Ac,\n"
         << "            A1-SphInvRange-Ac, A2-Parallax-Mc,\n"
@@ -147,6 +155,17 @@ std::optional<fs::path> find_camera_file(const fs::path& original) {
     return std::nullopt;
 }
 
+std::optional<InputFiles> find_input_files(const fs::path& dataset_root) {
+    const fs::path feature = dataset_root / "Feature.txt";
+    const fs::path xyz = dataset_root / "XYZ.txt";
+    const fs::path calib = dataset_root / "cal.txt";
+    const auto cam = find_camera_file(dataset_root);
+    if (!cam || !fs::exists(feature) || !fs::exists(xyz) || !fs::exists(calib)) {
+        return std::nullopt;
+    }
+    return InputFiles{*cam, feature, xyz, calib};
+}
+
 std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
                                             const std::string& dataset_filter) {
     std::vector<DatasetPaths> datasets;
@@ -154,6 +173,78 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
         return datasets;
     }
 
+    std::unordered_set<std::string> seen;
+    auto add_dataset = [&](const std::string& base_name,
+                           const std::string& problem_name,
+                           const std::string& run_name,
+                           const fs::path& base_root,
+                           const fs::path& run_root,
+                           const fs::path& reference_original) {
+        if (!dataset_filter.empty() &&
+            base_name != dataset_filter &&
+            problem_name != dataset_filter &&
+            run_name != dataset_filter) {
+            return;
+        }
+
+        const auto files = find_input_files(run_root);
+        if (!files) {
+            std::cerr << "Skip malformed dataset: " << base_name
+                      << " / " << run_name << "\n";
+            return;
+        }
+
+        const std::string key = run_key(base_name, run_name, "", "");
+        if (!seen.insert(key).second) {
+            return;
+        }
+
+        datasets.push_back({base_name,
+                            run_name,
+                            base_root,
+                            run_root,
+                            reference_original,
+                            files->cam,
+                            files->feature,
+                            files->xyz,
+                            files->calib});
+    };
+
+    auto maybe_add_initial_value_problem = [&](const fs::path& problem_root,
+                                               const std::string& category_name) {
+        const fs::path initial_value = problem_root / "Initial Value";
+        if (!fs::is_directory(initial_value)) {
+            return;
+        }
+        const std::string problem_name = problem_root.filename().string();
+        const std::string base_name =
+            category_name.empty() ? problem_name : category_name + "__" + problem_name;
+        add_dataset(base_name,
+                    problem_name,
+                    "Initial Value",
+                    problem_root,
+                    initial_value,
+                    problem_root / "Ground Truth");
+    };
+
+    // Native BA Datasets layout:
+    // <root>/<category>/<problem>/{Ground Truth, Initial Value}/...
+    maybe_add_initial_value_problem(problems_root, "");
+    for (const auto& first_entry : fs::directory_iterator(problems_root)) {
+        if (!first_entry.is_directory()) {
+            continue;
+        }
+        const std::string first_name = first_entry.path().filename().string();
+        maybe_add_initial_value_problem(first_entry.path(), "");
+        for (const auto& second_entry : fs::directory_iterator(first_entry.path())) {
+            if (second_entry.is_directory()) {
+                maybe_add_initial_value_problem(second_entry.path(), first_name);
+            }
+        }
+    }
+
+    // Prepared benchmark layout:
+    // <root>/<base-dataset>/original and <root>/<base-dataset>/quality/<run-name>/...
     for (const auto& base_entry : fs::directory_iterator(problems_root)) {
         if (!base_entry.is_directory()) {
             continue;
@@ -163,7 +254,6 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
         const fs::path reference_original = base_entry.path() / "original";
         const fs::path quality_root = base_entry.path() / "quality";
         if (!fs::is_directory(quality_root)) {
-            std::cerr << "Skip dataset without quality folder: " << base_name << "\n";
             continue;
         }
 
@@ -179,24 +269,12 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
                 continue;
             }
 
-            const fs::path feature = quality_entry.path() / "Feature.txt";
-            const fs::path xyz = quality_entry.path() / "XYZ.txt";
-            const fs::path calib = quality_entry.path() / "cal.txt";
-            const auto cam = find_camera_file(quality_entry.path());
-            if (!cam || !fs::exists(feature) || !fs::exists(xyz) || !fs::exists(calib)) {
-                std::cerr << "Skip malformed quality dataset: " << quality_name << "\n";
-                continue;
-            }
-
-            datasets.push_back({base_name,
-                                quality_name,
-                                base_entry.path(),
-                                quality_entry.path(),
-                                reference_original,
-                                *cam,
-                                feature,
-                                xyz,
-                                calib});
+            add_dataset(base_name,
+                        base_name,
+                        quality_name,
+                        base_entry.path(),
+                        quality_entry.path(),
+                        reference_original);
         }
     }
 
@@ -212,8 +290,8 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    fs::path problems_root = "E:/zuo/projects/CEP/PVL-BA-Bench";
-    fs::path output_root = "E:/zuo/projects/CEP/benchmark-results";
+    fs::path problems_root = "E:/zuo/projects/CEP/BA Datasets";
+    fs::path output_root = "E:/zuo/projects/CEP/benchmark_initial_value_clean";
     std::vector<MethodId> selected_methods = all_methods();
     std::string dataset_filter;
     BenchmarkOutputMode output_mode = BenchmarkOutputMode::CleanTiming;
