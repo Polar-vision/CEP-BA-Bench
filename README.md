@@ -99,6 +99,19 @@ example_v2\build\Release\example.exe
 The reported benchmark uses the BA Datasets collection, specifically the
 Initial Value tier. The runner can read this native layout directly:
 
+The collection is organized into four scene categories:
+
+| Category | Problems | Description | Dataset Access |
+| --- | ---: | --- | --- |
+| `Close-Range` | 12 | close-range indoor and outdoor photogrammetry scenes | [Google Drive](https://drive.google.com/drive/folders/1mvsQEFGBvZ-VcfxIJ3hqXiBV3tVTPMSe) |
+| `Oblique-5` | 30 | five-camera oblique aerial blocks | [Google Drive](https://drive.google.com/drive/folders/1NDOMrSZocyTG7JEdLQ7KdujHUKDikmQa) |
+| `UAV` | 34 | UAV image blocks for aerial reconstruction | [Google Drive](https://drive.google.com/drive/folders/1-VA-JrVe03PVZnswjuLAvx_EC7vqzSXN) |
+| `Vehicle` | 29 | vehicle-mounted multi-camera sequences | [Google Drive](https://drive.google.com/drive/folders/1_GID2a5O5CSfUn5QfoWFhhnA_NwI5kmi) |
+
+Together these folders provide 105 Initial Value benchmark problems. Each
+problem contains one `Initial Value` folder used as the degraded initialization
+input and one `Ground Truth` folder retained as the reference reconstruction.
+
 ```text
 BA Datasets/
   Close-Range/
@@ -121,6 +134,13 @@ BA Datasets/
 The benchmark uses `Initial Value` as the optimization input. `Ground Truth`
 is retained as the reference reconstruction when reference-recovery analysis is
 performed outside the clean timing run.
+
+Expected files:
+
+- `cal.txt`: camera intrinsic parameters, including focal length and principal point values.
+- `Cam.txt` or `Cam-*.txt`: Euler-angle camera orientation, camera center, and camera ID records.
+- `XYZ.txt`: object-point coordinates for the corresponding tier.
+- `Feature.txt`: feature tracks, with image indices and image coordinates for each observation.
 
 For compatibility with older run manifests, the runner also accepts this
 prepared layout:
