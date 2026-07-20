@@ -1,86 +1,117 @@
-#include <cstddef>
-#include <iostream>
-#ifndef _BA_H
-#define _BA_H
+#pragma once
 
 #ifdef BA_EXPORTS
     #define BAapi __declspec(dllexport)
 #elif defined(BA_STATIC)
-    #define BAapi  // 静态库无修饰符
+    #define BAapi
 #else
     #define BAapi __declspec(dllimport)
 #endif
 
-typedef enum ObjectPointType{
-	//zero archors
-	xyz=0,
-	xy_inverse_z=1,
-	depth=2,
-	inverse_depth=3,
-	//one archors
-	archored_xyz=4,
-	archored_xy_inverse_z=5,
-	archored_depth=6,
-	archored_inverse_depth=7,
-	//two archors
-	parallax=8
-}objectpointtype;
+enum ObjectPointType {
+    xyz = 0,
+    xy_inverse_z = 1,
+    depth = 2,
+    inverse_depth = 3,
+    archored_xyz = 4,
+    archored_xy_inverse_z = 5,
+    archored_depth = 6,
+    archored_inverse_depth = 7,
+    anchored_xyz = archored_xyz,
+    anchored_xy_inverse_z = archored_xy_inverse_z,
+    anchored_depth = archored_depth,
+    anchored_inverse_depth = archored_inverse_depth,
+    parallax = 8,
+    anchor_camera_xyz = 9,
+    anchor_camera_xy_inverse_z = 10,
+    anchor_camera_spherical_range = 11,
+    anchor_camera_spherical_inverse_range = 12,
+    parallax_camera = 13,
+};
+using objectpointtype = ObjectPointType;
 
-typedef enum Rotation3DType{
-	euler_angle=0,
-	axis_angle=1,
-	quaternion=2
-}rotation3dtype;
-
-typedef enum ImagePointType{
-	uv=0,
-	light_cone=1
-}imagepointtype;
-
-typedef enum ParameterType{
-	rotation_translation_landmark=0,
-	rotation_landmark=1,
-	translation_landmark=2,
-	rotation_translation=3,
-	landmark=4,
-	rotation=5,
-	translation=6
-}parametertype;
-
-typedef enum ManifoldType{
-	lie=0,
-	quaternion_manifold=1,
-	euclidean_manifold=2,
-	sphere_manifold=3,
-	line_manifold=4,
-	none=5
-}manifoldtype;
-
-class IBA;//PBA和SBA的基类
-class BAapi BAExporter
-{
-public:
-	bool ba_run(char *szCam = NULL,
-				char *szFea = NULL,
-				char *szXYZ = NULL,
-				char *szCalib = NULL,
-				char *szReport = NULL,
-				char *szPose = NULL,
-				char *sz3D = NULL,
-				objectpointtype optype = xyz,
-				rotation3dtype r3dtype = euler_angle,
-				imagepointtype iptype = uv,
-				parametertype paramtype = rotation_translation_landmark,
-				manifoldtype manitype = none);
-
-	bool ba_initialize( char* szCamera, char* szFeature, char* szCalib =  NULL, char* szXYZ = NULL );
-
-
-	BAExporter();
-	~BAExporter();
-
-private:
-	IBA* ptr;
+enum class MethodId {
+    A0_XYZ = 0,
+    A0_INV_DIST,
+    A0_DEPTH,
+    A0_INV_DEPTH,
+    A1_XYZ,
+    A1_INV_DIST,
+    A1_DEPTH,
+    A1_INV_DEPTH,
+    A2_PA,
+    A1_XYZ_AC,
+    A1_XY_INV_Z_AC,
+    A1_SPH_RANGE_AC,
+    A1_SPH_INV_RANGE_AC,
+    A2_PARALLAX_MC,
 };
 
-#endif
+enum class BenchmarkOutputMode {
+    CleanTiming = 0,
+    Diagnostic = 1,
+};
+
+struct BARunMetrics {
+    bool success = false;
+    int cameras = 0;
+    int points = 0;
+    int observations = 0;
+    int iterations = 0;
+    int accepted_steps = 0;
+    int rejected_steps = 0;
+    int linear_solver_iterations = 0;
+    int termination_type = 0;
+    double initial_cost = 0.0;
+    double final_cost = 0.0;
+    double initial_rmse_px = 0.0;
+    double final_rmse_px = 0.0;
+    double initial_gradient_max_norm = 0.0;
+    double final_gradient_max_norm = 0.0;
+    double final_gradient_norm = 0.0;
+    double gradient_reduction_ratio_final = 0.0;
+    int reached_gradient_tolerance = 0;
+    int iterations_to_gradient_tolerance = -1;
+    double final_relative_function_decrease = 0.0;
+    double final_relative_step_size = 0.0;
+    double final_lm_gain_ratio = 0.0;
+    double final_gradient_lipschitz_estimate = 0.0;
+    double final_direction_quality = 0.0;
+    double solver_time_sec = 0.0;
+    double linear_solver_time_sec = 0.0;
+};
+
+BAapi const char* method_id_name(MethodId method);
+BAapi bool method_id_from_name(const char* name, MethodId* method);
+BAapi objectpointtype method_object_point_type(MethodId method);
+BAapi const char* benchmark_output_mode_name(BenchmarkOutputMode mode);
+
+class IBA;
+
+class BAapi BAExporter {
+public:
+    BAExporter();
+    ~BAExporter();
+
+    bool ba_run(const char* szCam = nullptr,
+                const char* szFea = nullptr,
+                const char* szXYZ = nullptr,
+                const char* szCalib = nullptr,
+                const char* szReport = nullptr,
+                const char* szPose = nullptr,
+                const char* sz3D = nullptr,
+                MethodId method = MethodId::A0_XYZ,
+                BenchmarkOutputMode output_mode = BenchmarkOutputMode::Diagnostic,
+                int point_condition_sample = 0,
+                int schur_sample = 0);
+
+    bool ba_initialize(const char* szCamera,
+                       const char* szFeature,
+                       const char* szCalib = nullptr,
+                       const char* szXYZ = nullptr);
+
+    const BARunMetrics& last_metrics() const;
+
+private:
+    IBA* ptr;
+};

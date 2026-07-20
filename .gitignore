@@ -1,0 +1,56 @@
+# Build outputs
+build/
+build_*/
+*/build/
+*/build_*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.tlog
+*.recipe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.dll
+*.exp
+*.exe
+
+# Benchmark datasets and generated results
+BA Datasets/
+PVL-BA-Bench/
+benchmark*/
+synthetic_benchmark/
+synthetic_benchmark_scale/
+parallaxba_ijrr_reproduction/
+benchmark-results/
+benchmark-diagnostics/
+benchmark-figures/
+
+# Local run state
+*.pid
+*.stdout.log
+*.stderr.log
+started_at.txt
+finished_at.txt
+resumed_at.txt
+run_command.txt
+
+# Python cache and analysis scratch
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Papers and extracted reference text
+*.pdf
+*_extracted.txt
+docs/*_extracted.txt
+
+# Editor and OS noise
+.vs/
+.vscode/
+Desktop.ini
+Thumbs.db

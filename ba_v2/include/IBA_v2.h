@@ -8,16 +8,6 @@
 #include <time.h>
 
 #include <Eigen/Core>
-// #include <Eigen/Geometry>
-// #include <Eigen/LU>
-// #include <Eigen/StdVector>
-// #include <Eigen/Cholesky>
-
-#include "ceres/ceres.h"
-#include "ceres/rotation.h"
-#include "ceres/manifold.h"
-// #include "ceres/local_parameterization.h"
-#include "sophus/se3.hpp"
 
 #define PI  3.1415926535898 
 #define MAXARCHOR 0.5
@@ -34,22 +24,22 @@ class IBA
 {
 public:
     IBA(void);
-    ~IBA(void);
+    virtual ~IBA(void);
 
-	virtual bool ba_run(char* szCam, 
-		                char* szFea, 
-						char* szXYZ, 
-						char* szCalib, 
+	virtual bool ba_run(char* szCam,
+		                char* szFea,
+						char* szXYZ,
+						char* szCalib,
 						char* szReport,
 						char* szPose,
-						char* sz3D, 
-						objectpointtype optype,
-    					rotation3dtype r3dtype,
-						imagepointtype iptype,
-						parametertype paramtype,
-    					manifoldtype manitype)=0;
+						char* sz3D,
+						MethodId method,
+						BenchmarkOutputMode output_mode,
+						int point_condition_sample,
+						int schur_sample)=0;
 
 	virtual bool ba_initialize(char* szCamera, char* szFeature, char* szCalib = NULL, char* szXYZ = NULL)=0;
+	const BARunMetrics& last_metrics() const { return m_last_metrics; }
 
 	int findNcameras(FILE* fp);
 	void ba_readCameraPoseration(char* fname, double* ical);
@@ -83,17 +73,14 @@ public:
 	char* m_szCamePose;
 	char* m_sz3Dpts;
 	char* m_szReport;
+	BARunMetrics m_last_metrics;
 
 	struct Intrinsic{
 		double fx, fy, cx, cy;
 	};
 	struct Camera{
 		double euler_angle[3];
-		double axis_angle[3];
-		double quat[4];
 		double camera_center[3];
-		double translation[3];
-		double se3[7];
 		int camidx;
 	};
 	struct Point3D{
@@ -101,46 +88,32 @@ public:
 		double xy_inverse_z[3];
 		double archored_xyz[3];//take main archor as reference
 		double archored_xy_inverse_z[3];//take main archor as reference
-		double inverse_depth;//take main archor as reference
-		double depth;//take main archor as reference
-		double direction[2];//take main archor as reference
+		double archored_spherical_range[3];//azimuth, elevation and range as one Schur point block
+		double archored_spherical_inverse_range[3];//azimuth, elevation and inverse range as one Schur point block
 
 		double world_depth[3];
 		double world_inverse_depth[3];
 
-		double parallax;//take main archor and associate archor as references
+		double parallax_world[3];//azimuth, elevation and parallax as one Schur point block
+		double anchor_camera_xyz[3];
+		double anchor_camera_xy_inverse_z[3];
+		double anchor_camera_spherical_range[3];
+		double anchor_camera_spherical_inverse_range[3];
+		double parallax_camera[3];
 
-		int nM;//Ö÷Ãªµã
-		int nA;//¸±Ãªµã
+		int nM;//ä¸»é”šç‚¹
+		int nA;//å‰¯é”šç‚¹
 	};
 	struct Observation{
 		int view_idx;
 		double u, v;
-		double lightcone;
-		double polar;
 	};
 	struct Track{
 		int nview;
 		std::vector<Observation> obss;
 	};
-	struct FObservation{
-		int feature_idx;
-		double u,v;
-		double lightcone;
-		double polar;
-	};
-	// struct ImageTrack{
-	// 	int idx;
-	// 	std::vector<FObservation> fobs;
-	// };
-	struct Ray{
-		double ray[3];
-	};
 	std::vector<Intrinsic> intrs;
 	std::vector<Camera> cams;
 	std::vector<Point3D> points;
 	std::vector<Track> tracks;
-	std::vector<Ray> rays;
-	// std::unordered_map<int, std::vector<FObservation>> image_tracks;
-	std::map<int, std::vector<FObservation>> image_tracks;
 };

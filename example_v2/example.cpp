@@ -1,183 +1,425 @@
 #include "BAExporter_v2.h"
-#include "dataPath.h"
-#include <vector>
-#include <map>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <optional>
 #include <string>
-using namespace std;
+#include <unordered_set>
+#include <vector>
 
-int main(int argc, char* argv[] )
-{
-	for(int i=0;i<1;i++){
-		// if(i!=0&&i!=7&&i!=8){
-		// 	continue;
-		// }
-		printf("hello ba!\n");
-		// argv[1] = const_cast<char*>(dt);
+namespace fs = std::filesystem;
 
-		/*Parameterization of image point*/
-		imagepointtype iptype;
-		for(int j=0;j<2;j++){
-			switch(j){
-				case 0:iptype=uv;break;
-				case 1:iptype=light_cone;break;
-			}
+namespace {
 
-			/*Parameterization of object point*/
-			objectpointtype optype;
-			switch(i){
-				case 0:optype=xyz;break;
-				case 1:optype=xy_inverse_z;break;
-				case 2:optype=depth;break;
-				case 3:optype=inverse_depth;break;
-				case 4:optype=archored_xyz;break;
-				case 5:optype=archored_xy_inverse_z;break;
-				case 6:optype=archored_depth;break;
-				case 7:optype=archored_inverse_depth;break;
-				case 8:optype=parallax;break;
-			}
-			//zero archor
-			// optype=xyz;
-			// optype=xy_inverse_z;
-			// optype=depth;
-			// optype=inverse_depth;
-			//one archor
-			// optype=archored_xyz;
-			// optype=archored_xy_inverse_z;
-			// optype=archored_depth;
-			// optype=archored_inverse_depth;
-			//two archors
-			// optype=parallax;
-			/*Parameterization of 3d rotation*/
-			rotation3dtype r3dtype;
-			r3dtype=euler_angle;
-			// r3dtype=axis_angle;
-			// r3dtype=quaternion;
-			
-			parametertype paramtype;
-			// paramtype=rotation_translation_landmark;
-			// paramtype=rotation_translation;
-			// paramtype=rotation_landmark;
-			// paramtype=translation_landmark;
-			paramtype=rotation;
-			// paramtype=translation;
-			// paramtype=landmark;
+struct DatasetPaths {
+    std::string base_name;
+    std::string name;
+    fs::path base_root;
+    fs::path quality_root;
+    fs::path reference_original;
+    fs::path cam;
+    fs::path feature;
+    fs::path xyz;
+    fs::path calib;
+};
 
-			manifoldtype manitype;
-			// manitype=lie;
-			// manitype=quaternion_manifold;
-			// manitype=line_manifold;
-			// manitype=sphere_manifold;
-			// manitype=euclidean_manifold;
-			manitype=none;
-
-			const char* object_point_type;
-			const char* image_point_type;
-			const char* rotation_3d_type;
-			const char* parameter_type;
-			const char* manifold_type;
-			switch (optype)
-			{
-			case xyz:
-				object_point_type="xyz";break;
-			case xy_inverse_z:	
-				object_point_type="xy_inverse_z";break;
-			case depth:
-				object_point_type="depth";break;
-			case inverse_depth:
-				object_point_type="inverse_depth";break;
-			case archored_xyz:
-				object_point_type="archored_xyz";break;
-			case archored_xy_inverse_z:
-				object_point_type="archored_xy_inverse_z";break;
-			case archored_depth:
-				object_point_type="archored_depth";break;
-			case archored_inverse_depth:
-				object_point_type="archored_inverse_depth";break;
-			case parallax:
-				object_point_type="parallax";break;	
-			}
-			switch (r3dtype)
-			{
-			case euler_angle:
-				rotation_3d_type="euler_angle";break;
-			case axis_angle:
-				rotation_3d_type="angle_axis";break;
-			case quaternion:
-				rotation_3d_type="quaternion";break;
-			}
-			switch(iptype)
-			{
-			case uv:
-				image_point_type="uv";break;
-			case light_cone:
-				image_point_type="light_cone";break;
-			}
-			switch(paramtype)
-			{
-			case rotation_translation_landmark:
-				parameter_type="rotation_translation_landmark";break;
-			case rotation_landmark:
-				parameter_type="rotation_landmark";break;
-			case translation_landmark:
-				parameter_type="translation_landmark";break;
-			case rotation_translation:
-				parameter_type="rotation_translation";break;
-			case rotation:
-				parameter_type="rotation";break;
-			case translation:
-				parameter_type="translation";break;
-			case landmark:
-				parameter_type="landmark";break;
-			}
-			switch(manitype)
-			{
-			case lie:
-				manifold_type="lie";break;
-			case quaternion_manifold:
-				manifold_type="quaternion_manifold";break;
-			case sphere_manifold:
-				manifold_type="sphere_manifold";break;
-			case line_manifold:
-				manifold_type="line_manifold";break;
-			case euclidean_manifold:
-				manifold_type="euclidean_manifold";break;
-
-			}
-
-			string pCheck = string(object_point_type)+"_"+rotation_3d_type+"_"+image_point_type;
-			string originalPath(dt);
-			size_t pos = originalPath.find_last_of("/\\");
-			string parentPath = (pos != string::npos) ? originalPath.substr(0, pos) : "";
-			string pP = parentPath + "/";
-			string p1 = pP + "Cam.txt";//被噪声污染后的外参
-			string p2 = pP + "Feature.txt";
-			string p3 = pP + "XYZ.txt";//重新三角化后的物点
-			string p4 = pP + "cal.txt";
-			string pReport = "-report.txt";
-			string pPose = "-FinalPose.txt";
-			string p3D = "-Final3D.ply";
-			string p5, p6, p7, pInit3D;
-			pInit3D = pP + "XYZ.ply";
-
-			p5 = pP + pCheck + pReport;
-			p6 = pP + pCheck + pPose;
-			p7 = pP + pCheck + p3D;
-
-			char* szCam = const_cast<char*>(p1.c_str());
-			char* szFea = const_cast<char*>(p2.c_str());
-			//char* szXYZ = NULL;
-			char* szXYZ = const_cast<char*>(p3.c_str());
-			char* szCalib = const_cast<char*>(p4.c_str());
-			char* szReport = const_cast<char*>(p5.c_str()); 
-			char* szPose = const_cast<char*>(p6.c_str()); 
-			char* sz3D = const_cast<char*>(p7.c_str()); 
-
-			BAExporter BA;
-			BA.ba_run(szCam, szFea, szXYZ, szCalib, szReport, szPose, sz3D, optype,r3dtype,iptype,paramtype,manitype);
-		}
-	}
-
-
-	return 0;
+const char* summary_header() {
+    return "base_dataset,quality_dataset,method,mode,status,wall_time_sec,"
+           "solver_time_sec,linear_solver_time_sec,cameras,points,observations,"
+           "initial_cost,final_cost,initial_rmse_px,final_rmse_px,iterations,"
+           "accepted_steps,rejected_steps,linear_solver_iterations,"
+           "initial_gradient_max_norm,final_gradient_max_norm,final_gradient_norm,"
+           "gradient_reduction_ratio_final,reached_gradient_tolerance,"
+           "iterations_to_gradient_tolerance,final_relative_function_decrease,"
+           "final_relative_step_size,final_lm_gain_ratio,"
+           "final_gradient_lipschitz_estimate,final_direction_quality,"
+           "termination_type,report";
 }
 
+std::string run_key(const std::string& base_dataset,
+                    const std::string& quality_dataset,
+                    const std::string& method,
+                    const std::string& mode) {
+    constexpr char separator = '\x1f';
+    return base_dataset + separator + quality_dataset + separator + method + separator + mode;
+}
+
+bool parse_summary_prefix(const std::string& line, std::vector<std::string>* fields) {
+    if (fields == nullptr) {
+        return false;
+    }
+    fields->clear();
+    std::size_t begin = 0;
+    for (int field = 0; field < 5; ++field) {
+        const std::size_t end = line.find(',', begin);
+        if (end == std::string::npos) {
+            fields->clear();
+            return false;
+        }
+        fields->push_back(line.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    return true;
+}
+
+const std::vector<MethodId>& all_methods() {
+    static const std::vector<MethodId> methods = {
+        MethodId::A0_XYZ,
+        MethodId::A0_INV_DIST,
+        MethodId::A0_DEPTH,
+        MethodId::A0_INV_DEPTH,
+        MethodId::A1_XYZ_AC,
+        MethodId::A1_XY_INV_Z_AC,
+        MethodId::A1_SPH_RANGE_AC,
+        MethodId::A1_SPH_INV_RANGE_AC,
+        MethodId::A2_PARALLAX_MC,
+        MethodId::A1_XYZ,
+        MethodId::A1_INV_DIST,
+        MethodId::A1_DEPTH,
+        MethodId::A1_INV_DEPTH,
+        MethodId::A2_PA,
+    };
+    return methods;
+}
+
+bool output_mode_from_name(const std::string& name, BenchmarkOutputMode* mode) {
+    if (mode == nullptr) {
+        return false;
+    }
+    std::string value = name;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (value == "clean" || value == "timing" || value == "clean-timing") {
+        *mode = BenchmarkOutputMode::CleanTiming;
+        return true;
+    }
+    if (value == "diagnostic" || value == "diagnostics" || value == "debug") {
+        *mode = BenchmarkOutputMode::Diagnostic;
+        return true;
+    }
+    return false;
+}
+
+void print_usage(const char* exe) {
+    std::cout
+        << "Usage: " << exe << " [--problems <BA-problems>] [--out <results>]\n"
+        << "                  [--method <MethodId>] [--limit <N>] [--dataset <name>]\n"
+        << "                  [--mode clean|diagnostic] [--resume]\n"
+        << "                  [--no-xyz]\n"
+        << "                  [--point-condition-sample <N>]\n"
+        << "                  [--schur-sample <N>]\n"
+        << "\n"
+        << "Only quality subdatasets are run. The original set is kept as reference.\n"
+        << "Method IDs: A0-XYZ-W, A0-XYInvZ-W, A0-SphRange-W, A0-SphInvRange-W,\n"
+        << "            A1-XYZ-Ac, A1-XYInvZ-Ac, A1-SphRange-Ac,\n"
+        << "            A1-SphInvRange-Ac, A2-Parallax-Mc,\n"
+        << "            A1-XYZ-Aw, A1-XYInvZ-Aw, A1-SphRange-Aw,\n"
+        << "            A1-SphInvRange-Aw, A2-Parallax-Mw\n"
+        << "Modes: clean writes only summary.csv; diagnostic also writes report,\n"
+        << "       metrics.json, convergence.txt, FinalPose.txt, and Final3D.ply.\n"
+        << "--resume retains successful rows, reruns failures, and skips completed runs.\n";
+}
+
+bool is_cam_file(const fs::path& path) {
+    const std::string name = path.filename().string();
+    return fs::is_regular_file(path) &&
+           name.rfind("Cam", 0) == 0 &&
+           path.extension() == ".txt";
+}
+
+std::optional<fs::path> find_camera_file(const fs::path& original) {
+    const fs::path canonical = original / "Cam.txt";
+    if (fs::is_regular_file(canonical)) {
+        return canonical;
+    }
+
+    for (const auto& entry : fs::directory_iterator(original)) {
+        if (is_cam_file(entry.path())) {
+            return entry.path();
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
+                                            const std::string& dataset_filter) {
+    std::vector<DatasetPaths> datasets;
+    if (!fs::exists(problems_root)) {
+        return datasets;
+    }
+
+    for (const auto& base_entry : fs::directory_iterator(problems_root)) {
+        if (!base_entry.is_directory()) {
+            continue;
+        }
+
+        const std::string base_name = base_entry.path().filename().string();
+        const fs::path reference_original = base_entry.path() / "original";
+        const fs::path quality_root = base_entry.path() / "quality";
+        if (!fs::is_directory(quality_root)) {
+            std::cerr << "Skip dataset without quality folder: " << base_name << "\n";
+            continue;
+        }
+
+        for (const auto& quality_entry : fs::directory_iterator(quality_root)) {
+            if (!quality_entry.is_directory()) {
+                continue;
+            }
+
+            const std::string quality_name = quality_entry.path().filename().string();
+            if (!dataset_filter.empty() &&
+                base_name != dataset_filter &&
+                quality_name != dataset_filter) {
+                continue;
+            }
+
+            const fs::path feature = quality_entry.path() / "Feature.txt";
+            const fs::path xyz = quality_entry.path() / "XYZ.txt";
+            const fs::path calib = quality_entry.path() / "cal.txt";
+            const auto cam = find_camera_file(quality_entry.path());
+            if (!cam || !fs::exists(feature) || !fs::exists(xyz) || !fs::exists(calib)) {
+                std::cerr << "Skip malformed quality dataset: " << quality_name << "\n";
+                continue;
+            }
+
+            datasets.push_back({base_name,
+                                quality_name,
+                                base_entry.path(),
+                                quality_entry.path(),
+                                reference_original,
+                                *cam,
+                                feature,
+                                xyz,
+                                calib});
+        }
+    }
+
+    std::sort(datasets.begin(), datasets.end(), [](const DatasetPaths& a, const DatasetPaths& b) {
+        if (a.base_name != b.base_name) {
+            return a.base_name < b.base_name;
+        }
+        return a.name < b.name;
+    });
+    return datasets;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    fs::path problems_root = "E:/zuo/projects/CEP/PVL-BA-Bench";
+    fs::path output_root = "E:/zuo/projects/CEP/benchmark-results";
+    std::vector<MethodId> selected_methods = all_methods();
+    std::string dataset_filter;
+    BenchmarkOutputMode output_mode = BenchmarkOutputMode::CleanTiming;
+    int point_condition_sample = 0;
+    int schur_sample = 0;
+    std::size_t limit = 0;
+    bool resume = false;
+    bool use_xyz = true;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg == "--problems" && i + 1 < argc) {
+            problems_root = argv[++i];
+        } else if (arg == "--out" && i + 1 < argc) {
+            output_root = argv[++i];
+        } else if (arg == "--method" && i + 1 < argc) {
+            MethodId method;
+            if (!method_id_from_name(argv[++i], &method)) {
+                std::cerr << "Unknown Method ID.\n";
+                print_usage(argv[0]);
+                return 2;
+            }
+            selected_methods = {method};
+        } else if (arg == "--limit" && i + 1 < argc) {
+            limit = static_cast<std::size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--dataset" && i + 1 < argc) {
+            dataset_filter = argv[++i];
+        } else if (arg == "--mode" && i + 1 < argc) {
+            if (!output_mode_from_name(argv[++i], &output_mode)) {
+                std::cerr << "Unknown output mode.\n";
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (arg == "--diagnostic") {
+            output_mode = BenchmarkOutputMode::Diagnostic;
+        } else if (arg == "--clean-timing") {
+            output_mode = BenchmarkOutputMode::CleanTiming;
+        } else if (arg == "--resume") {
+            resume = true;
+        } else if (arg == "--no-xyz") {
+            use_xyz = false;
+        } else if (arg == "--point-condition-sample" && i + 1 < argc) {
+            point_condition_sample = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--schur-sample" && i + 1 < argc) {
+            schur_sample = std::max(0, std::stoi(argv[++i]));
+        } else {
+            std::cerr << "Unknown or incomplete argument: " << arg << "\n";
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
+
+    const auto datasets = discover_datasets(problems_root, dataset_filter);
+    if (datasets.empty()) {
+        std::cerr << "No valid BA datasets found in " << problems_root << "\n";
+        return 1;
+    }
+
+    fs::create_directories(output_root);
+    const fs::path summary_path = output_root / "summary.csv";
+    std::unordered_set<std::string> completed_runs;
+    std::vector<std::string> retained_rows;
+    if (resume && fs::exists(summary_path)) {
+        std::ifstream existing_summary(summary_path);
+        std::string line;
+        std::getline(existing_summary, line);
+        std::vector<std::string> fields;
+        while (std::getline(existing_summary, line)) {
+            if (!parse_summary_prefix(line, &fields) || fields[4] != "ok") {
+                continue;
+            }
+            const std::string key = run_key(fields[0], fields[1], fields[2], fields[3]);
+            if (completed_runs.insert(key).second) {
+                retained_rows.push_back(line);
+            }
+        }
+    }
+
+    std::ofstream summary(summary_path, std::ios::trunc);
+    if (!summary) {
+        std::cerr << "Cannot open benchmark summary: " << summary_path << "\n";
+        return 1;
+    }
+    summary << summary_header() << "\n";
+    for (const auto& row : retained_rows) {
+        summary << row << "\n";
+    }
+    summary.flush();
+    if (resume) {
+        std::cout << "Resume retained " << retained_rows.size()
+                  << " successful runs from " << summary_path << "\n";
+    }
+
+    const std::size_t dataset_count =
+        limit > 0 ? std::min(limit, datasets.size()) : datasets.size();
+    const std::size_t total_runs = dataset_count * selected_methods.size();
+    std::size_t processed = 0;
+    std::size_t run_index = 0;
+    std::size_t skipped_runs = 0;
+    std::size_t attempted_runs = 0;
+    for (const auto& dataset : datasets) {
+        if (limit > 0 && processed >= limit) {
+            break;
+        }
+        ++processed;
+
+        for (const MethodId method : selected_methods) {
+            ++run_index;
+            const std::string method_name = method_id_name(method);
+            const std::string mode_name = benchmark_output_mode_name(output_mode);
+            const std::string key =
+                run_key(dataset.base_name, dataset.name, method_name, mode_name);
+            if (resume && completed_runs.find(key) != completed_runs.end()) {
+                ++skipped_runs;
+                continue;
+            }
+            ++attempted_runs;
+            const bool diagnostics = output_mode == BenchmarkOutputMode::Diagnostic;
+            const fs::path run_dir = output_root / dataset.base_name / dataset.name / method_name;
+            if (diagnostics) {
+                fs::create_directories(run_dir);
+            }
+
+            const fs::path report = run_dir / "report.txt";
+            const fs::path pose = run_dir / "FinalPose.txt";
+            const fs::path points = run_dir / "Final3D.ply";
+
+            const std::string cam_s = dataset.cam.string();
+            const std::string feature_s = dataset.feature.string();
+            const std::string xyz_s = dataset.xyz.string();
+            const std::string calib_s = dataset.calib.string();
+            const std::string report_s = report.string();
+            const std::string pose_s = pose.string();
+            const std::string points_s = points.string();
+
+            std::cout << "\n[" << run_index << "/" << total_runs << "] "
+                      << dataset.base_name << " / " << dataset.name << " / "
+                      << method_name << " (" << mode_name << ")" << std::endl;
+            const auto t0 = std::chrono::steady_clock::now();
+            bool ok = false;
+            BARunMetrics metrics;
+            try {
+                BAExporter ba;
+                ok = ba.ba_run(cam_s.c_str(),
+                               feature_s.c_str(),
+                               use_xyz ? xyz_s.c_str() : nullptr,
+                               calib_s.c_str(),
+                               diagnostics ? report_s.c_str() : nullptr,
+                               diagnostics ? pose_s.c_str() : nullptr,
+                               diagnostics ? points_s.c_str() : nullptr,
+                               method,
+                               output_mode,
+                               diagnostics ? point_condition_sample : 0,
+                               diagnostics ? schur_sample : 0);
+                metrics = ba.last_metrics();
+            } catch (const std::exception& ex) {
+                std::cerr << "Run failed: " << ex.what() << "\n";
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+            summary << dataset.base_name << ','
+                    << dataset.name << ','
+                    << method_name << ','
+                    << mode_name << ','
+                    << (ok ? "ok" : "failed") << ','
+                    << std::fixed << std::setprecision(6) << elapsed << ','
+                    << metrics.solver_time_sec << ','
+                    << metrics.linear_solver_time_sec << ','
+                    << metrics.cameras << ','
+                    << metrics.points << ','
+                    << metrics.observations << ','
+                    << std::setprecision(15)
+                    << metrics.initial_cost << ','
+                    << metrics.final_cost << ','
+                    << metrics.initial_rmse_px << ','
+                    << metrics.final_rmse_px << ','
+                    << metrics.iterations << ','
+                    << metrics.accepted_steps << ','
+                    << metrics.rejected_steps << ','
+                    << metrics.linear_solver_iterations << ','
+                    << metrics.initial_gradient_max_norm << ','
+                    << metrics.final_gradient_max_norm << ','
+                    << metrics.final_gradient_norm << ','
+                    << metrics.gradient_reduction_ratio_final << ','
+                    << metrics.reached_gradient_tolerance << ','
+                    << metrics.iterations_to_gradient_tolerance << ','
+                    << metrics.final_relative_function_decrease << ','
+                    << metrics.final_relative_step_size << ','
+                    << metrics.final_lm_gain_ratio << ','
+                    << metrics.final_gradient_lipschitz_estimate << ','
+                    << metrics.final_direction_quality << ','
+                    << metrics.termination_type << ','
+                    << (diagnostics ? report.string() : "") << "\n";
+            summary.flush();
+            if (ok) {
+                completed_runs.insert(key);
+            }
+        }
+    }
+
+    std::cout << "\nAttempted runs: " << attempted_runs << "\n"
+              << "Skipped completed runs: " << skipped_runs << "\n"
+              << "Benchmark summary: " << summary_path << "\n";
+    return 0;
+}

@@ -1,315 +1,584 @@
 #include "PBAImp_v2.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <Eigen/Eigenvalues>
+#include <Eigen/QR>
+#include <Eigen/SVD>
+
+#include "ceres/version.h"
+
+namespace {
+
+double clamp_acos_arg(double value) {
+	return std::max(-1.0, std::min(1.0, value));
+}
+
+bool environment_flag(const char* name, bool fallback = false) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) {
+		return fallback;
+	}
+	const std::string text(value);
+	if (text == "1" || text == "true" || text == "TRUE" ||
+		text == "yes" || text == "YES") {
+		return true;
+	}
+	if (text == "0" || text == "false" || text == "FALSE" ||
+		text == "no" || text == "NO") {
+		return false;
+	}
+	return fallback;
+}
+
+int environment_int(const char* name, int fallback) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) {
+		return fallback;
+	}
+	try {
+		return std::stoi(value);
+	} catch (...) {
+		return fallback;
+	}
+}
+
+double environment_double(const char* name, double fallback) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) {
+		return fallback;
+	}
+	try {
+		return std::stod(value);
+	} catch (...) {
+		return fallback;
+	}
+}
+
+constexpr double kDiagnosticEpsilon = 1e-30;
+
+struct DiagnosticParameterBlock {
+	double* values = nullptr;
+	int ambient_size = 0;
+	int tangent_size = 0;
+	const ceres::Manifold* manifold = nullptr;
+};
+
+struct DiagnosticIterationState {
+	ceres::IterationSummary iteration;
+	std::vector<double> parameters;
+	double parameter_norm = 0.0;
+};
+
+struct StrictDiagnosticMetrics {
+	bool vector_metrics_available = false;
+	double initial_gradient_max_norm = 0.0;
+	double final_gradient_reduction_ratio = 0.0;
+	int reached_gradient_tolerance = 0;
+	int iterations_to_gradient_tolerance = -1;
+	double final_relative_function_decrease = 0.0;
+	double final_relative_step_size = 0.0;
+	double final_lm_gain_ratio = 0.0;
+	double final_gradient_lipschitz_estimate = 0.0;
+	double final_direction_quality = 0.0;
+};
+
+double nan_value() {
+	return std::numeric_limits<double>::quiet_NaN();
+}
+
+double squared_norm(const std::vector<double>& values) {
+	double sum = 0.0;
+	for (double value : values) {
+		sum += value * value;
+	}
+	return sum;
+}
+
+double l2_norm(const std::vector<double>& values) {
+	return std::sqrt(squared_norm(values));
+}
+
+double dot_product(const std::vector<double>& lhs, const std::vector<double>& rhs) {
+	if (lhs.size() != rhs.size()) {
+		return nan_value();
+	}
+	double sum = 0.0;
+	for (std::size_t i = 0; i < lhs.size(); ++i) {
+		sum += lhs[i] * rhs[i];
+	}
+	return sum;
+}
+
+std::string diagnostic_parent_directory(const char* report_path) {
+	if (report_path == nullptr) {
+		return ".";
+	}
+	const std::string path(report_path);
+	const size_t separator = path.find_last_of("/\\");
+	return separator == std::string::npos ? "." : path.substr(0, separator);
+}
+
+std::vector<double> default_gradient_thresholds(double solver_gradient_tolerance) {
+	std::vector<double> thresholds = {1e-2, 1e-4, 1e-6, 1e-8, 1e-10};
+	if (solver_gradient_tolerance > 0.0 &&
+		std::find(thresholds.begin(), thresholds.end(), solver_gradient_tolerance) ==
+			thresholds.end()) {
+		thresholds.push_back(solver_gradient_tolerance);
+	}
+	std::sort(thresholds.begin(), thresholds.end(), std::greater<double>());
+	return thresholds;
+}
+
+std::vector<DiagnosticParameterBlock> collect_active_parameter_blocks(
+	ceres::Problem& problem) {
+	std::vector<double*> all_blocks;
+	problem.GetParameterBlocks(&all_blocks);
+	std::vector<DiagnosticParameterBlock> blocks;
+	blocks.reserve(all_blocks.size());
+	for (double* block : all_blocks) {
+		if (block == nullptr || problem.IsParameterBlockConstant(block)) {
+			continue;
+		}
+		const int tangent_size = problem.ParameterBlockTangentSize(block);
+		if (tangent_size <= 0) {
+			continue;
+		}
+		blocks.push_back(DiagnosticParameterBlock{
+			block,
+			problem.ParameterBlockSize(block),
+			tangent_size,
+			problem.GetManifold(block)});
+	}
+	return blocks;
+}
+
+std::size_t ambient_parameter_size(
+	const std::vector<DiagnosticParameterBlock>& blocks) {
+	std::size_t size = 0;
+	for (const auto& block : blocks) {
+		size += static_cast<std::size_t>(block.ambient_size);
+	}
+	return size;
+}
+
+std::size_t tangent_parameter_size(
+	const std::vector<DiagnosticParameterBlock>& blocks) {
+	std::size_t size = 0;
+	for (const auto& block : blocks) {
+		size += static_cast<std::size_t>(block.tangent_size);
+	}
+	return size;
+}
+
+void snapshot_parameters(
+	const std::vector<DiagnosticParameterBlock>& blocks,
+	std::vector<double>* values) {
+	if (values == nullptr) {
+		return;
+	}
+	values->clear();
+	values->reserve(ambient_parameter_size(blocks));
+	for (const auto& block : blocks) {
+		values->insert(values->end(), block.values, block.values + block.ambient_size);
+	}
+}
+
+double active_parameter_norm(const std::vector<double>& values) {
+	return l2_norm(values);
+}
+
+void restore_parameters(
+	const std::vector<DiagnosticParameterBlock>& blocks,
+	const std::vector<double>& values) {
+	std::size_t offset = 0;
+	for (const auto& block : blocks) {
+		if (offset + static_cast<std::size_t>(block.ambient_size) > values.size()) {
+			return;
+		}
+		std::copy(values.begin() + offset,
+			values.begin() + offset + block.ambient_size,
+			block.values);
+		offset += static_cast<std::size_t>(block.ambient_size);
+	}
+}
+
+bool tangent_delta(
+	const std::vector<DiagnosticParameterBlock>& blocks,
+	const std::vector<double>& previous,
+	const std::vector<double>& current,
+	std::vector<double>* delta) {
+	if (delta == nullptr || previous.size() != current.size()) {
+		return false;
+	}
+	delta->assign(tangent_parameter_size(blocks), 0.0);
+	std::size_t ambient_offset = 0;
+	std::size_t tangent_offset = 0;
+	for (const auto& block : blocks) {
+		if (ambient_offset + static_cast<std::size_t>(block.ambient_size) >
+			previous.size()) {
+			return false;
+		}
+		if (block.manifold != nullptr) {
+			if (!block.manifold->Minus(
+					current.data() + ambient_offset,
+					previous.data() + ambient_offset,
+					delta->data() + tangent_offset)) {
+				return false;
+			}
+		} else {
+			for (int i = 0; i < block.ambient_size; ++i) {
+				(*delta)[tangent_offset + i] =
+					current[ambient_offset + i] - previous[ambient_offset + i];
+			}
+		}
+		ambient_offset += static_cast<std::size_t>(block.ambient_size);
+		tangent_offset += static_cast<std::size_t>(block.tangent_size);
+	}
+	return true;
+}
+
+class StrictDiagnosticIterationCallback final : public ceres::IterationCallback {
+public:
+	explicit StrictDiagnosticIterationCallback(
+		std::vector<DiagnosticParameterBlock> blocks)
+		: blocks_(std::move(blocks)) {}
+
+	ceres::CallbackReturnType operator()(
+		const ceres::IterationSummary& summary) override {
+		DiagnosticIterationState state;
+		state.iteration = summary;
+		snapshot_parameters(blocks_, &state.parameters);
+		state.parameter_norm = active_parameter_norm(state.parameters);
+		states_.push_back(std::move(state));
+		return ceres::SOLVER_CONTINUE;
+	}
+
+	const std::vector<DiagnosticIterationState>& states() const {
+		return states_;
+	}
+
+private:
+	std::vector<DiagnosticParameterBlock> blocks_;
+	std::vector<DiagnosticIterationState> states_;
+};
+
+StrictDiagnosticMetrics write_strict_diagnostics(
+	ceres::Problem& problem,
+	const std::vector<DiagnosticParameterBlock>& blocks,
+	const std::vector<DiagnosticIterationState>& states,
+	const ceres::Solver::Summary& summary,
+	int nobs,
+	double gradient_tolerance,
+	const std::string& parent) {
+	StrictDiagnosticMetrics result;
+	if (summary.iterations.empty()) {
+		return result;
+	}
+
+	const double initial_gradient =
+		summary.iterations.front().gradient_max_norm;
+	result.initial_gradient_max_norm = initial_gradient;
+	if (!summary.iterations.empty()) {
+		const auto& final_iteration = summary.iterations.back();
+		result.final_gradient_reduction_ratio =
+			(initial_gradient - final_iteration.gradient_max_norm) /
+			(initial_gradient + kDiagnosticEpsilon);
+		result.final_lm_gain_ratio = final_iteration.relative_decrease;
+	}
+
+	const std::vector<double> thresholds =
+		default_gradient_thresholds(gradient_tolerance);
+	const std::string thresholds_path = parent + "/gradient_thresholds.csv";
+	FILE* threshold_fp = nullptr;
+	fopen_s(&threshold_fp, thresholds_path.c_str(), "w");
+	if (threshold_fp != nullptr) {
+		fprintf(threshold_fp,
+			"threshold,reached,iteration,cost,rmse_px\n");
+		for (double threshold : thresholds) {
+			int reached = 0;
+			int iteration = -1;
+			double cost = nan_value();
+			double rmse = nan_value();
+			for (const auto& it : summary.iterations) {
+				if (it.gradient_max_norm <= threshold) {
+					reached = 1;
+					iteration = it.iteration;
+					cost = it.cost;
+					rmse = nobs > 0 ? std::sqrt(2.0 * it.cost / nobs) : nan_value();
+					break;
+				}
+			}
+			if (threshold == gradient_tolerance) {
+				result.reached_gradient_tolerance = reached;
+				result.iterations_to_gradient_tolerance = iteration;
+			}
+			fprintf(threshold_fp, "%.17g,%d,%d,%.17g,%.17g\n",
+				threshold, reached, iteration, cost, rmse);
+		}
+		fclose(threshold_fp);
+	}
+
+	std::vector<std::vector<double>> gradients;
+	bool vector_metrics_available =
+		!blocks.empty() && states.size() == summary.iterations.size();
+	std::vector<double> final_parameters;
+	if (vector_metrics_available) {
+		snapshot_parameters(blocks, &final_parameters);
+		gradients.reserve(states.size());
+		ceres::Problem::EvaluateOptions evaluation_options;
+		evaluation_options.apply_loss_function = true;
+		evaluation_options.num_threads = 1;
+		evaluation_options.parameter_blocks.reserve(blocks.size());
+		for (const auto& block : blocks) {
+			evaluation_options.parameter_blocks.push_back(block.values);
+		}
+		for (const auto& state : states) {
+			restore_parameters(blocks, state.parameters);
+			std::vector<double> gradient;
+			double evaluated_cost = 0.0;
+			if (!problem.Evaluate(
+					evaluation_options, &evaluated_cost, nullptr, &gradient, nullptr) ||
+				gradient.size() != tangent_parameter_size(blocks)) {
+				vector_metrics_available = false;
+				break;
+			}
+			gradients.push_back(std::move(gradient));
+		}
+		restore_parameters(blocks, final_parameters);
+	}
+	result.vector_metrics_available = vector_metrics_available;
+
+	const double final_cost = summary.final_cost;
+	const double initial_cost = summary.initial_cost;
+	const double total_cost_reduction =
+		std::max(std::abs(initial_cost - final_cost), kDiagnosticEpsilon);
+
+	const std::string convergence_path = parent + "/convergence.txt";
+	FILE* convergence_fp = nullptr;
+	fopen_s(&convergence_fp, convergence_path.c_str(), "w");
+	const std::string strict_path = parent + "/convergence_strict.csv";
+	FILE* strict_fp = nullptr;
+	fopen_s(&strict_fp, strict_path.c_str(), "w");
+	const char* header =
+		"iteration,cost,rmse_px,cost_change,relative_function_decrease,"
+		"normalized_convergence_progress,gradient_max_norm,gradient_norm,"
+		"gradient_reduction_ratio,step_norm,step_tangent_norm,x_norm,"
+		"relative_step_size,gradient_lipschitz_estimate,direction_quality,"
+		"lm_gain_ratio,gain_ratio,trust_region_radius,lm_damping,"
+		"linear_solver_eta,linear_solver_iterations,step_valid,step_successful\n";
+	if (convergence_fp != nullptr) {
+		fprintf(convergence_fp, "%s", header);
+	}
+	if (strict_fp != nullptr) {
+		fprintf(strict_fp, "%s", header);
+	}
+
+	for (std::size_t i = 0; i < summary.iterations.size(); ++i) {
+		const auto& it = summary.iterations[i];
+		const double rmse = nobs > 0 ? std::sqrt(2.0 * it.cost / nobs) : nan_value();
+		const double previous_cost =
+			i > 0 ? summary.iterations[i - 1].cost : it.cost;
+		const double relative_function_decrease =
+			i > 0 ? (previous_cost - it.cost) /
+				std::max(std::abs(previous_cost), kDiagnosticEpsilon) : 0.0;
+		const double normalized_progress =
+			(initial_cost - it.cost) / total_cost_reduction;
+		const double gradient_reduction_ratio =
+			(initial_gradient - it.gradient_max_norm) /
+			(initial_gradient + kDiagnosticEpsilon);
+		const double lm_damping =
+			it.trust_region_radius > 0.0 ? 1.0 / it.trust_region_radius : 0.0;
+		double x_norm = nan_value();
+		double step_tangent_norm = nan_value();
+		double relative_step_size = nan_value();
+		double lipschitz = nan_value();
+		double direction_quality = nan_value();
+		if (i < states.size()) {
+			x_norm = states[i].parameter_norm;
+		}
+		if (i > 0 && i < states.size()) {
+			std::vector<double> delta;
+			if (tangent_delta(blocks, states[i - 1].parameters,
+					states[i].parameters, &delta)) {
+				step_tangent_norm = l2_norm(delta);
+				const double previous_norm = states[i - 1].parameter_norm;
+				relative_step_size =
+					step_tangent_norm / (previous_norm + kDiagnosticEpsilon);
+				if (vector_metrics_available && gradients.size() == states.size()) {
+					std::vector<double> gradient_delta(gradients[i].size(), 0.0);
+					for (std::size_t j = 0; j < gradient_delta.size(); ++j) {
+						gradient_delta[j] = gradients[i][j] - gradients[i - 1][j];
+					}
+					lipschitz =
+						l2_norm(gradient_delta) /
+						(step_tangent_norm + kDiagnosticEpsilon);
+					direction_quality =
+						-dot_product(gradients[i - 1], delta) /
+						((l2_norm(gradients[i - 1]) * step_tangent_norm) +
+						 kDiagnosticEpsilon);
+				}
+			}
+		}
+		if (i + 1 == summary.iterations.size()) {
+			result.final_relative_function_decrease =
+				relative_function_decrease;
+			result.final_relative_step_size = relative_step_size;
+			result.final_gradient_lipschitz_estimate = lipschitz;
+			result.final_direction_quality = direction_quality;
+		}
+
+		const auto write_row = [&](FILE* fp) {
+			if (fp == nullptr) {
+				return;
+			}
+			fprintf(fp,
+				"%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
+				"%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
+				"%.17g,%.17g,%.17g,%.17g,%.17g,%d,%d,%d\n",
+				it.iteration,
+				it.cost,
+				rmse,
+				it.cost_change,
+				relative_function_decrease,
+				normalized_progress,
+				it.gradient_max_norm,
+				it.gradient_norm,
+				gradient_reduction_ratio,
+				it.step_norm,
+				step_tangent_norm,
+				x_norm,
+				relative_step_size,
+				lipschitz,
+				direction_quality,
+				it.relative_decrease,
+				it.relative_decrease,
+				it.trust_region_radius,
+				lm_damping,
+				it.eta,
+				it.linear_solver_iterations,
+				it.step_is_valid ? 1 : 0,
+				it.step_is_successful ? 1 : 0);
+		};
+		write_row(convergence_fp);
+		write_row(strict_fp);
+	}
+	if (convergence_fp != nullptr) {
+		fclose(convergence_fp);
+	}
+	if (strict_fp != nullptr) {
+		fclose(strict_fp);
+	}
+
+	return result;
+}
+
+enum class AnchorPolicy {
+	kCurrent,
+	kCurrentPairPaperOrder,
+	kCurrentPairPaperOrderRefine,
+	kTrueMaxParallax,
+	kMaxParallaxReproj,
+	kScoreReproj,
+	kScoreBaselineReproj
+};
+
+std::string normalized_environment_string(const char* name) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) {
+		return "";
+	}
+	std::string text(value);
+	for (char& ch : text) {
+		if (ch == '-' || ch == '.' || ch == ' ') {
+			ch = '_';
+		} else {
+			ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		}
+	}
+	return text;
+}
+
+AnchorPolicy anchor_policy_from_environment() {
+	const std::string text = normalized_environment_string("CEP_ANCHOR_POLICY");
+	if (text.empty() || text == "current" || text == "default") {
+		return AnchorPolicy::kCurrent;
+	}
+	if (text == "current_pair_paper_order" || text == "paper_order") {
+		return AnchorPolicy::kCurrentPairPaperOrder;
+	}
+	if (text == "current_pair_paper_order_refine" || text == "paper_order_refine") {
+		return AnchorPolicy::kCurrentPairPaperOrderRefine;
+	}
+	if (text == "true_max_parallax" || text == "max_parallax") {
+		return AnchorPolicy::kTrueMaxParallax;
+	}
+	if (text == "max_parallax_reproj") {
+		return AnchorPolicy::kMaxParallaxReproj;
+	}
+	if (text == "score_reproj") {
+		return AnchorPolicy::kScoreReproj;
+	}
+	if (text == "score_baseline_reproj") {
+		return AnchorPolicy::kScoreBaselineReproj;
+	}
+	return AnchorPolicy::kCurrent;
+}
+
+}  // namespace
+
 PBA::PBA(void)
 {
+	m_ncams = m_n3Dpts = m_n2Dprojs = m_nS = nc_ = 0;
+	m_archor = nullptr;
+	m_photo = m_feature = nullptr;
+	m_motstruct = m_imgpts = nullptr;
+	m_XYZ = nullptr;
+	m_K = nullptr;
+	m_V = nullptr;
+	m_vmask = m_umask = m_smask = nullptr;
+	m_imgptsSum = m_struct = m_pnt2main = m_archorSort = nullptr;
+	m_KR = m_KdA = m_KdB = m_KdG = m_P = nullptr;
 	m_bProvideXYZ = false;
 	m_bFocal = false;
-	m_szCameraInit = m_szFeatures = m_szCalibration = m_szXYZ = m_sz3Dpts = m_szCamePose = m_szReport = NULL;
+	m_szCameraInit = m_szFeatures = m_szCalibration = m_szXYZ = m_sz3Dpts = m_szCamePose = m_szReport = nullptr;
+	m_last_metrics = BARunMetrics{};
 }
 
 
 PBA::~PBA(void)
 {
-	if ( m_szCameraInit!= NULL)	free(m_szCameraInit);
-	if ( m_szFeatures!= NULL)	free(m_szFeatures);
-	if ( m_szCalibration!= NULL)	free(m_szCalibration);
-	if ( m_szXYZ!= NULL)		free(m_szXYZ);
-	if ( m_szCamePose!= NULL)	free(m_szCamePose);
-	if ( m_sz3Dpts!= NULL)		free(m_sz3Dpts);
-	if ( m_szReport!= NULL)		free(m_szReport);
-}
-
-double light_cone_obs(double u, double v, 
-                                  double fx, double fy, 
-                                  double cx, double cy) {
-    Eigen::Vector3d ray(
-        (u - cx) / fx,
-        (v - cy) / fy,
-        1.0
-    );
-    
-    ray.normalize();
-    
-    Eigen::Vector3d optical_axis(0.0, 0.0, 1.0);
-    
-    double cos_theta = optical_axis.dot(ray);
-    cos_theta = std::clamp(cos_theta, -1.0, 1.0);
-    
-    return std::acos(cos_theta);
-}
-
-
-double PBA::lc_rep(){
-	double s = 0.0;
-	int nobs = 0;
-	for (int i = 0; i < tracks.size(); i++)
-	{ 
-		nobs += tracks[i].nview;
-		int nM = points[i].nM;
-		int nA = points[i].nA;
-
-		for (int j = 0; j < tracks[i].nview; j++)
-		{
-			int view_idx = tracks[i].obss[j].view_idx;
-			double u = tracks[i].obss[j].u;
-			double v = tracks[i].obss[j].v;
-			double fx = 0, fy = 0, cx = 0, cy = 0;
-			int cam_idx = cams[view_idx].camidx;
-			fx = intrs[cam_idx-1].fx;
-			fy = intrs[cam_idx-1].fy;
-			cx = intrs[cam_idx-1].cx;
-			cy = intrs[cam_idx-1].cy;
-	
-			int nP = view_idx;
-			double lco = atan(sqrt(((u - cx) / fx) * ((u - cx) / fx) + ((v - cy) / fy) * ((v - cy) / fy)));
-
-			double R[9];
-			double ey = cams[nP].euler_angle[0];
-			double ex = cams[nP].euler_angle[1];
-			double ez = cams[nP].euler_angle[2];
-			double c1 = cos(ey), c2 = cos(ex), c3 = cos(ez);
-			double s1 = sin(ey), s2 = sin(ex), s3 = sin(ez);
-			R[0]=c1*c3-s1*s2*s3;     R[1]=c2*s3;     R[2]=s1*c3+c1*s2*s3;
-			R[3]=-c1*s3-s1*s2*c3;    R[4]=c2*c3;     R[5]=-s1*s3+c1*s2*c3;
-			R[6]=-s1*c2;             R[7]=-s2;       R[8]=c1*c2;
-
-			double Xc[3];
-			Xc[0] = points[i].xyz[0] - cams[nP].camera_center[0];
-			Xc[1] = points[i].xyz[1] - cams[nP].camera_center[1];
-			Xc[2] = points[i].xyz[2] - cams[nP].camera_center[2];
-
-			double p[3];
-			p[0] = R[0] * Xc[0] + R[1] * Xc[1] + R[2] * Xc[2];
-			p[1] = R[3] * Xc[0] + R[4] * Xc[1] + R[5] * Xc[2];
-			p[2] = R[6] * Xc[0] + R[7] * Xc[1] + R[8] * Xc[2];
-
-			double lcp = atan(sqrt(p[0] * p[0] + p[1] * p[1]) / p[2]);
-
-			// Residual
-			double res2 = (lcp - lco)*(lcp - lco);
-			s += res2;
-		}
-	}
-	s /= (2*nobs);
-	return sqrt(s);
-}
-
-struct CostRecorderCallback_simple : public ceres::IterationCallback {
-    std::vector<double>& costs;
-
-    CostRecorderCallback_simple(std::vector<double>& costs_) : costs(costs_) {}
-
-    virtual ceres::CallbackReturnType operator()(const ceres::IterationSummary& summary) override {
-        costs.push_back(summary.cost);  
-        return ceres::SOLVER_CONTINUE;
-    }
-};
-struct CostRecorderCallback : public ceres::IterationCallback {
-    std::vector<double>& costs;
-    std::vector<std::vector<double>>& euler_history; // 每次迭代存全部相机欧拉角
-    std::vector<PBA::Camera>& cameras; // 指向相机数组
-    int num_cams;    // 相机数量
-
-    CostRecorderCallback(std::vector<double>& costs_,
-                         std::vector<std::vector<double>>& euler_history_,
-                         std::vector<PBA::Camera>& cams, int num_cams_)
-        : costs(costs_), euler_history(euler_history_),
-          cameras(cams), num_cams(num_cams_) {}
-
-    virtual ceres::CallbackReturnType operator()(const ceres::IterationSummary& summary) override {
-        costs.push_back(summary.cost);
-        // 保存本轮迭代所有相机的欧拉角
-        std::vector<double> this_iter;
-        this_iter.reserve(num_cams * 6);
-        for (int i = 0; i < num_cams; i++) {
-            this_iter.push_back(cameras[i].euler_angle[0]);
-            this_iter.push_back(cameras[i].euler_angle[1]);
-            this_iter.push_back(cameras[i].euler_angle[2]);
-			this_iter.push_back(cameras[i].camera_center[0]);
-			this_iter.push_back(cameras[i].camera_center[1]);
-			this_iter.push_back(cameras[i].camera_center[2]);
-        }
-        euler_history.push_back(this_iter);
-
-        return ceres::SOLVER_CONTINUE;
-    }
-};
-
-void PBA::narrow_test(){
-	ceres::Problem problem;
-	ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
-	//1.6 degree test
-	Camera cam;
-	cam.camera_center[0]=0;
-	cam.camera_center[1]=0;
-	cam.camera_center[2]=0;
-	cam.euler_angle[0]=0;
-	cam.euler_angle[1]=0;
-	cam.euler_angle[2]=0;
-	cams.push_back(cam);
-	cam.camera_center[0]=10;
-	cam.camera_center[1]=0;
-	cam.camera_center[2]=0;
-	cam.euler_angle[0]=0;
-	cam.euler_angle[1]=0;
-	cam.euler_angle[2]=0;
-	cams.push_back(cam);
-	Point3D point;
-	point.xyz[0]=cams[1].camera_center[0]/2;
-	point.xyz[1]=0;
-	double ray1[3],ray2[3];
-	ray1[0] = point.xyz[0]-cams[0].camera_center[0];
-	ray1[1] = point.xyz[1]-cams[0].camera_center[1];
-	ray2[0] = point.xyz[0]-cams[1].camera_center[0];
-	ray2[1] = point.xyz[1]-cams[1].camera_center[1];
-	// for(double i=10000;i>100;i/=1.1){
-		point.xyz[2]=355;
-		point.nM=0;
-		point.nA=1;
-		ray1[2] = point.xyz[2]-cams[0].camera_center[2];
-		ray2[2] = point.xyz[2]-cams[1].camera_center[2];
-
-		double norm_ray1 = sqrt(ray1[0]*ray1[0]+ray1[1]*ray1[1]+ray1[2]*ray1[2]);
-		double norm_ray2 = sqrt(ray2[0]*ray2[0]+ray2[1]*ray2[1]+ray2[2]*ray2[2]);
-
-		double dot_ray = ray1[0]*ray2[0]+ray1[1]*ray2[1]+ray1[2]*ray2[2];
-		point.parallax = acos(dot_ray/(norm_ray1*norm_ray2));
-		point.direction[0] = atan2( ray1[0], ray1[2] );				
-		point.direction[1] = atan2( ray1[1], sqrt(ray1[0]*ray1[0]+ ray1[2]*ray1[2]));
-		points.push_back(point);
-		// double intersect_angle = acos(dot_ray/(norm_ray1*norm_ray2))*180/PI;
-		// printf("%s%f%s%f%s\n","depth:",i,"  intersection angle:",intersect_angle,"degree");
-		printf("%s%f%s\n","intersection angle:",point.parallax*180/PI,"degree");
-	// }
-	// Normalize
-	double xp1 = ray1[0] / ray1[2], xp2 = ray2[0] / ray2[2];
-	double yp1 = ray1[1] / ray1[2], yp2 = ray2[1] / ray2[2];
-
-	// Project
-	double fx = 4209.003931;
-	double fy = 4220.634348;
-	double cx = 2736;
-	double cy = 1824;
-	Track track;
-	track.nview = 2;
-
-	for(int i=0;i<track.nview;i++){
-		Observation obs;
-		obs.view_idx = i;
-		obs.u = fx * xp1 + cx;
-		obs.v = fy * yp1 + cy;
-		track.obss.push_back(obs);
-		printf("%s%f%s%f%s\n","(u,v)=(",obs.u,",",obs.v,")");
-	}
-	tracks.push_back(track);
-	for(int i=0;i<cams.size();i++){
-		printf("%s%f %f %f %f %f %f%s\n","(phi,omega,kappa,x,y,z)=(",cams[i].euler_angle[0],cams[i].euler_angle[1],cams[i].euler_angle[2],
-			cams[i].camera_center[0],cams[i].camera_center[1],cams[i].camera_center[2],")");
-	}
-	for(int i=0;i<points.size();i++){
-		printf("%s%f %f %f %f %f %f%s\n","(X,Y,Z,alpha,beta,gamma)=(",points[i].xyz[0],points[i].xyz[1],points[i].xyz[2],
-			points[i].direction[0]*180/PI,points[i].direction[1]*180/PI,points[i].parallax*180/PI,")");
-	}
-	FILE* Gfp1w = NULL,* Gfp2w = NULL;
-	Gfp1w = fopen("E:/zuo/projects/backup/data/narrow_test/G-XYZ.txt", "w");
-	for (const auto& it : points) {
-		fprintf(Gfp1w, "%f %f %f\n", it.xyz[0], it.xyz[1], it.xyz[2]);
-	}
-	Gfp2w = fopen("E:/zuo/projects/backup/data/narrow_test/G-Cam.txt", "w");
-	for(const auto& it:cams){
-		fprintf(Gfp2w, "%f %f %f %f %f %f\n", it.euler_angle[0], it.euler_angle[1], it.euler_angle[2],
-		                                     it.camera_center[0],it.camera_center[1],it.camera_center[2]);
-	}
-	fclose(Gfp1w);
-	fclose(Gfp2w);
-
-	random_device rd;
-	mt19937 gen(rd());
-	normal_distribution<> dist_uv(0, 2);
-	normal_distribution<> dist_euler(0, 4);
-	normal_distribution<> dist_xyz(0, 10);
-	normal_distribution<> dist_XYZ(0, 20);
-
-	for(int i=0;i<tracks.size();i++){
-		int _nview=tracks[i].nview;
-		int nM=points[i].nM;
-		int nA=points[i].nA;
-		points[i].xyz[0]+=dist_XYZ(gen);
-		points[i].xyz[1]+=dist_XYZ(gen);
-		points[i].xyz[2]+=dist_XYZ(gen);
-
-		for(int j=0;j<_nview;j++){
-			int nP=tracks[i].obss[j].view_idx;
-			tracks[i].obss[j].u+=dist_uv(gen);
-			tracks[i].obss[j].v+=dist_uv(gen);
-			double u=tracks[i].obss[j].u;
-			double v=tracks[i].obss[j].v;
-			cams[nP].camera_center[0]+=dist_xyz(gen);
-			cams[nP].camera_center[1]+=dist_xyz(gen);
-			cams[nP].camera_center[2]+=dist_xyz(gen);
-			cams[nP].euler_angle[0]+=dist_euler(gen)*PI/180;
-			cams[nP].euler_angle[1]+=dist_euler(gen)*PI/180;
-			cams[nP].euler_angle[2]+=dist_euler(gen)*PI/180;				
-
-		}
-		ray1[0] = points[i].xyz[0]-cams[nM].camera_center[0];
-		ray1[1] = points[i].xyz[1]-cams[nM].camera_center[1];
-		ray1[2] = points[i].xyz[2]-cams[nM].camera_center[2];
-		ray2[0] = points[i].xyz[0]-cams[nA].camera_center[0];
-		ray2[1] = points[i].xyz[1]-cams[nA].camera_center[1];
-		ray2[2] = points[i].xyz[2]-cams[nA].camera_center[2];
-
-		norm_ray1 = sqrt(ray1[0]*ray1[0]+ray1[1]*ray1[1]+ray1[2]*ray1[2]);
-		norm_ray2 = sqrt(ray2[0]*ray2[0]+ray2[1]*ray2[1]+ray2[2]*ray2[2]);
-
-		dot_ray = ray1[0]*ray2[0]+ray1[1]*ray2[1]+ray1[2]*ray2[2];
-		points[i].parallax = acos(dot_ray/(norm_ray1*norm_ray2));
-		points[i].direction[0] = atan2( ray1[0], ray1[2] );				
-		points[i].direction[1] = atan2( ray1[1], sqrt(ray1[0]*ray1[0]+ ray1[2]*ray1[2]));
-	}
-
-	for(int i=0;i<tracks.size();i++){
-		for(int j=0;j<tracks[i].nview;j++){
-			printf("%s%f%s%f%s\n","(u,v)=(",tracks[i].obss[j].u,",",tracks[i].obss[j].v,")");
-		}
-	}
-	for(int i=0;i<cams.size();i++){
-		printf("%s%f %f %f %f %f %f%s\n","(phi,omega,kappa,x,y,z)=(",cams[i].euler_angle[0],cams[i].euler_angle[1],cams[i].euler_angle[2],
-			cams[i].camera_center[0],cams[i].camera_center[1],cams[i].camera_center[2],")");
-	}
-	for(int i=0;i<points.size();i++){
-		printf("%s%f %f %f %f %f %f%s\n","(X,Y,Z,alpha,beta,gamma)=(",points[i].xyz[0],points[i].xyz[1],points[i].xyz[2],
-			points[i].direction[0]*180/PI,points[i].direction[1]*180/PI,points[i].parallax*180/PI,")");
-	}
-	FILE* fp1w = NULL,* fp2w = NULL,* fp3w = NULL,* fp4w = NULL;
-	fp1w = fopen("E:/zuo/projects/backup/data/narrow_test/XYZ.txt", "w");
-	for (const auto& it : points) {
-		fprintf(fp1w, "%f %f %f\n", it.xyz[0], it.xyz[1], it.xyz[2]);
-	}
-	fp2w = fopen("E:/zuo/projects/backup/data/narrow_test/Cam.txt", "w");
-	for(const auto& it:cams){
-		fprintf(fp2w, "%f %f %f %f %f %f\n", it.euler_angle[0], it.euler_angle[1], it.euler_angle[2],
-		                                     it.camera_center[0],it.camera_center[1],it.camera_center[2]);
-	}
-	fp3w = fopen("E:/zuo/projects/backup/data/narrow_test/Feature.txt", "w");
-	for(const auto& it:tracks){
-		fprintf(fp3w,"%d",it.nview);
-		for(int i=0;i<it.nview;i++){
-			fprintf(fp3w,"  %d %f %f",it.obss[i].view_idx, it.obss[i].u, it.obss[i].v);
-		}
-		fprintf(fp3w,"\n");
-	}
-	fp4w = fopen("E:/zuo/projects/backup/data/narrow_test/cal.txt", "w");
-	fprintf(fp4w,"%f %d %f\n",fx,0,cx);
-	fprintf(fp4w,"%d %f %f\n",0,fy,cy);
-	fprintf(fp4w,"%d %d %d\n",0,0,1);
-	fclose(fp1w);
-	fclose(fp2w);
-	fclose(fp3w);
-	fclose(fp4w);
-	points.clear();
-	cams.clear();
-	tracks.clear();
+	free(m_archor);
+	free(m_photo);
+	free(m_feature);
+	free(m_motstruct);
+	free(m_imgpts);
+	free(m_XYZ);
+	free(m_K);
+	free(m_V);
+	free(m_vmask);
+	free(m_umask);
+	free(m_smask);
+	free(m_imgptsSum);
+	free(m_struct);
+	free(m_pnt2main);
+	free(m_archorSort);
+	free(m_KR);
+	free(m_KdA);
+	free(m_KdB);
+	free(m_KdG);
+	free(m_P);
 }
 
 void PBA::parallax2xyz(){
@@ -320,11 +589,11 @@ void PBA::parallax2xyz(){
 	double w, w2;
 	for (int i = 0; i < points.size(); i++)
 	{
-		w = points[i].parallax;
+		w = points[i].parallax_world[2];
 
-		xj[0] = sin(points[i].direction[0]) * cos(points[i].direction[1]);
-		xj[1] = sin(points[i].direction[1]);
-		xj[2] = cos(points[i].direction[0]) * cos(points[i].direction[1]);
+		xj[0] = sin(points[i].parallax_world[0]) * cos(points[i].parallax_world[1]);
+		xj[1] = sin(points[i].parallax_world[1]);
+		xj[2] = cos(points[i].parallax_world[0]) * cos(points[i].parallax_world[1]);
 
 		nM = points[i].nM;
 		nA = points[i].nA;
@@ -335,7 +604,7 @@ void PBA::parallax2xyz(){
 		
 		Dik = sqrt(Tik[0] * Tik[0] + Tik[1] * Tik[1] + Tik[2] * Tik[2]);
 		
-		w2 = acos((xj[0] * Tik[0] + xj[1] * Tik[1] + xj[2] * Tik[2]) / Dik);
+		w2 = acos(clamp_acos_arg((xj[0] * Tik[0] + xj[1] * Tik[1] + xj[2] * Tik[2]) / Dik));
 
 		xk[0] = (Dik * sin(w2 + w) * xj[0]) / sin(w);
 		xk[1] = (Dik * sin(w2 + w) * xj[1]) / sin(w);
@@ -348,9 +617,13 @@ void PBA::parallax2xyz(){
 }
 void PBA::xy_inverse_z2xyz(){
 	for(int i=0;i<points.size();i++){
-		points[i].xyz[0]=points[i].xy_inverse_z[0];
-		points[i].xyz[1]=points[i].xy_inverse_z[1];
-		points[i].xyz[2]=1/points[i].xy_inverse_z[2];
+		double rho = points[i].xy_inverse_z[2];
+		if (std::abs(rho) < 1e-12) {
+			rho = std::copysign(1e-12, rho == 0.0 ? 1.0 : rho);
+		}
+		points[i].xyz[0] = points[i].xy_inverse_z[0] / rho;
+		points[i].xyz[1] = points[i].xy_inverse_z[1] / rho;
+		points[i].xyz[2] = 1 / rho;
 	}
 }
 void PBA::depth2xyz(){
@@ -381,14 +654,16 @@ void PBA::archored_inverse_depth2xyz(){
 	double xj[3],xk[3];
 	int nM;
 	for(int i=0;i<points.size();i++){
-		xj[0] = sin(points[i].direction[0]) * cos(points[i].direction[1]);
-		xj[1] = sin(points[i].direction[1]);
-		xj[2] = cos(points[i].direction[0]) * cos(points[i].direction[1]);
+		xj[0] = sin(points[i].archored_spherical_inverse_range[0]) *
+			cos(points[i].archored_spherical_inverse_range[1]);
+		xj[1] = sin(points[i].archored_spherical_inverse_range[1]);
+		xj[2] = cos(points[i].archored_spherical_inverse_range[0]) *
+			cos(points[i].archored_spherical_inverse_range[1]);
 
 		nM = points[i].nM;
-		xk[0] = xj[0] / points[i].inverse_depth;
-		xk[1] = xj[1] / points[i].inverse_depth;
-		xk[2] = xj[2] / points[i].inverse_depth;
+		xk[0] = xj[0] / points[i].archored_spherical_inverse_range[2];
+		xk[1] = xj[1] / points[i].archored_spherical_inverse_range[2];
+		xk[2] = xj[2] / points[i].archored_spherical_inverse_range[2];
 
 		points[i].xyz[0] = cams[nM].camera_center[0] + xk[0];
 		points[i].xyz[1] = cams[nM].camera_center[1] + xk[1];
@@ -399,14 +674,16 @@ void PBA::archored_depth2xyz(){
 	double xj[3],xk[3];
 	int nM;
 	for(int i=0;i<points.size();i++){
-		xj[0] = sin(points[i].direction[0]) * cos(points[i].direction[1]);
-		xj[1] = sin(points[i].direction[1]);
-		xj[2] = cos(points[i].direction[0]) * cos(points[i].direction[1]);
+		xj[0] = sin(points[i].archored_spherical_range[0]) *
+			cos(points[i].archored_spherical_range[1]);
+		xj[1] = sin(points[i].archored_spherical_range[1]);
+		xj[2] = cos(points[i].archored_spherical_range[0]) *
+			cos(points[i].archored_spherical_range[1]);
 
 		nM = points[i].nM;
-		xk[0] = xj[0] * points[i].depth;
-		xk[1] = xj[1] * points[i].depth;
-		xk[2] = xj[2] * points[i].depth;
+		xk[0] = xj[0] * points[i].archored_spherical_range[2];
+		xk[1] = xj[1] * points[i].archored_spherical_range[2];
+		xk[2] = xj[2] * points[i].archored_spherical_range[2];
 
 		points[i].xyz[0] = cams[nM].camera_center[0] + xk[0];
 		points[i].xyz[1] = cams[nM].camera_center[1] + xk[1];
@@ -417,9 +694,15 @@ void PBA::archored_xy_inverse_z2xyz(){
 	int nM;
 	for(int i=0;i<points.size();i++){
 		nM = points[i].nM;
-		points[i].xyz[0] = cams[nM].camera_center[0] + points[i].archored_xy_inverse_z[0];
-		points[i].xyz[1] = cams[nM].camera_center[1] + points[i].archored_xy_inverse_z[1];
-		points[i].xyz[2] = cams[nM].camera_center[2] + 1/points[i].archored_xy_inverse_z[2];
+		double rho = points[i].archored_xy_inverse_z[2];
+		if (std::abs(rho) < 1e-12) {
+			rho = std::copysign(1e-12, rho == 0.0 ? 1.0 : rho);
+		}
+		points[i].xyz[0] = cams[nM].camera_center[0] +
+			points[i].archored_xy_inverse_z[0] / rho;
+		points[i].xyz[1] = cams[nM].camera_center[1] +
+			points[i].archored_xy_inverse_z[1] / rho;
+		points[i].xyz[2] = cams[nM].camera_center[2] + 1 / rho;
 	}
 }
 void PBA::archored_xyz2xyz(){
@@ -431,319 +714,135 @@ void PBA::archored_xyz2xyz(){
 		points[i].xyz[2] = cams[nM].camera_center[2] + points[i].archored_xyz[2];
 	}
 }
-void rotationMatrixToEulerAngles_phi_omega_kappa(double R[9], double eulerAngles[3])
-{
-	//assert(isRotationMatrix(R));
-	double sy = sqrt(R[1] * R[1] + R[4] * R[4]);
-
-	bool singular = sy < 1e-6;
-
-	double phi, omega, kappa;
-	if (!singular)
-	{
-		phi = atan2(-R[6], R[8]);
-		omega = atan2(-R[7], sy);
-		kappa = atan2(R[1], R[4]);
+void PBA::anchor_camera_xyz2xyz() {
+	for (int i = 0; i < static_cast<int>(points.size()); ++i) {
+		const int nM = points[i].nM;
+		double rotation_main[9];
+		double point_world_relative[3];
+		cep::cost::EulerToWorldToCamera(cams[nM].euler_angle, rotation_main);
+		cep::cost::MatTransposeVec(rotation_main,
+			points[i].anchor_camera_xyz,
+			point_world_relative);
+		points[i].xyz[0] = cams[nM].camera_center[0] + point_world_relative[0];
+		points[i].xyz[1] = cams[nM].camera_center[1] + point_world_relative[1];
+		points[i].xyz[2] = cams[nM].camera_center[2] + point_world_relative[2];
 	}
-	else
-	{
-		phi = atan2(-R[3], R[0]);
-		omega = atan2(-R[7], sy);
-		kappa = 0;
-	}
-	eulerAngles[0] = phi;
-	eulerAngles[1] = omega;
-	eulerAngles[2] = kappa;
 }
-void q2euc(const double q[4],double eu[3])
-{
-	double a=q[0],b=q[1],c=q[2],d=q[3];
-	double R[9];
-	R[0] = 1 - 2 * c * c - 2 * d * d;
-	R[1] = 2 * b * c - 2 * a * d;
-	R[2] = 2 * b * d + 2 * a * c;
-	R[3] = 2 * b * c + 2 * a * d;
-	R[4] = 1 - 2 * b * b - 2 * d * d;
-	R[5] = 2 * c * d - 2 * a * b;
-	R[6] = 2 * b * d - 2 * a * c;
-	R[7] = 2 * c * d + 2 * a * b;
-	R[8] = 1 - 2 * b * b - 2 * c * c;
-
-	rotationMatrixToEulerAngles_phi_omega_kappa(R, eu);
-}
-double DotProduct(const double x[3],const double y[3]){
-	return (x[0]*y[0]+x[1]*y[1]+x[2]*y[2]);
-}
-void axis2euc(const double angle_axis[3],double eu[3])
-{
-	double R[9];
-	double theta2=DotProduct(angle_axis,angle_axis);
-	if(theta2>numeric_limits<double>::epsilon()){
-		// We want to be careful to only evaluate the square root if the
-		// norm of the angle_axis vector is greater than zero. Otherwise
-		// we get a division by zero.
-		double theta=sqrt(theta2);
-		double wx=angle_axis[0]/theta;
-		double wy=angle_axis[1]/theta;
-		double wz=angle_axis[2]/theta;
-
-		double costheta=cos(theta);
-		double sintheta=sin(theta);
-
-		R[0] =     costheta   + wx*wx*(1 -    costheta);
-		R[3] =  wz*sintheta   + wx*wy*(1 -    costheta);
-		R[6] = -wy*sintheta   + wx*wz*(1 -    costheta);
-		R[1] =  wx*wy*(1 - costheta)     - wz*sintheta;
-		R[4] =     costheta   + wy*wy*(1 -    costheta);
-		R[7] =  wx*sintheta   + wy*wz*(1 -    costheta);
-		R[2] =  wy*sintheta   + wx*wz*(1 -    costheta);
-		R[5] = -wx*sintheta   + wy*wz*(1 -    costheta);
-		R[8] =     costheta   + wz*wz*(1 -    costheta);
-	}else{
-		// Near zero, we switch to using the first order Taylor expansion.
-		R[0] =  1;
-		R[3] =  angle_axis[2];
-		R[6] = -angle_axis[1];
-		R[1] = -angle_axis[2];
-		R[4] =  1;
-		R[7] =  angle_axis[0];
-		R[2] =  angle_axis[1];
-		R[5] = -angle_axis[0];
-		R[8] = 1;
-	}
-
-	rotationMatrixToEulerAngles_phi_omega_kappa(R, eu);
-}
-void PBA::IFeature(){
-	//feature first to image first
-	for (int i = 0; i < tracks.size(); i++)
-	{ 
-		for (int j = 0; j < tracks[i].nview; j++)
-		{ 
-			int view_idx = tracks[i].obss[j].view_idx;
-			double u = tracks[i].obss[j].u;
-			double v = tracks[i].obss[j].v;
-			double fx = 0, fy = 0, cx = 0, cy = 0;
-			int cam_idx = cams[view_idx].camidx;
-			fx = intrs[cam_idx-1].fx;
-			fy = intrs[cam_idx-1].fy;
-			cx = intrs[cam_idx-1].cx;
-			cy = intrs[cam_idx-1].cy;
-
-			double lco = atan(sqrt(((u - cx) / fx) * ((u - cx) / fx) + ((v - cy) / fy) * ((v - cy) / fy)));
-			double pol = atan2(u-cx,v-cy);
-			FObservation _fobs;
-			_fobs.feature_idx=i;
-			_fobs.u=u;
-			_fobs.v=v;
-			_fobs.lightcone=lco;
-			_fobs.polar=pol;
-			image_tracks[view_idx].push_back(_fobs);
+void PBA::anchor_camera_xy_inverse_z2xyz() {
+	for (int i = 0; i < static_cast<int>(points.size()); ++i) {
+		const int nM = points[i].nM;
+		double rho = points[i].anchor_camera_xy_inverse_z[2];
+		if (std::abs(rho) < 1e-12) {
+			rho = std::copysign(1e-12, rho == 0.0 ? 1.0 : rho);
 		}
-	}
-	string originalPath(m_szXYZ);
-	size_t pos = originalPath.find_last_of("/\\");
-	string parentPath = (pos != std::string::npos) ? originalPath.substr(0, pos) : "";
-	string ifeature_path = parentPath + "/IFeature.txt";
-	if(ifeature_path.c_str()!=NULL){
-		FILE *fp = nullptr;
-		fopen_s(&fp, ifeature_path.c_str(), "w");
-		for (auto &kv : image_tracks) {
-			int img_id = kv.first;
-			auto &obs_list = kv.second;
-			fprintf(fp,"%d  ",obs_list.size());
-			for (auto &obs : obs_list) {
-				fprintf(fp,"%d %lf %lf %lf  ",obs.feature_idx,obs.u,obs.v,obs.lightcone*180/PI);
-			}
-			fprintf(fp,"\n");
-    	}
-		fclose(fp);
+		double point_camera[3] = {
+			points[i].anchor_camera_xy_inverse_z[0] / rho,
+			points[i].anchor_camera_xy_inverse_z[1] / rho,
+			1.0 / rho,
+		};
+		double rotation_main[9];
+		double point_world_relative[3];
+		cep::cost::EulerToWorldToCamera(cams[nM].euler_angle, rotation_main);
+		cep::cost::MatTransposeVec(rotation_main, point_camera, point_world_relative);
+		points[i].xyz[0] = cams[nM].camera_center[0] + point_world_relative[0];
+		points[i].xyz[1] = cams[nM].camera_center[1] + point_world_relative[1];
+		points[i].xyz[2] = cams[nM].camera_center[2] + point_world_relative[2];
 	}
 }
-bool SolveYawFromProjection(
-    double u, double v,
-    double fx, double fy, double u0, double v0,
-    double Cx, double Cy, double Cz,
-    double ey,   
-    double ex, 
-    double X, double Y, double Z,
-    double& yaw_out)
-{
-    // 1) 归一化像平面坐标
-    const double xp = (u - u0) / fx;  // x'
-    const double yp = (v - v0) / fy;  // y'
-
-    // 2) 世界向量 v_w = P - C
-    const double vx = X - Cx;
-    const double vy = Y - Cy;
-    const double vz = Z - Cz;
-
-    // 3) 先绕 y 轴
-    const double cey  = std::cos(ey);
-    const double sey  = std::sin(ey);
-    const double v1x = cey * vx + sey * vz;
-    const double v1y = vy;
-    const double v1z = -sey * vx + cey * vz;
-
-	// 4) 再绕 x 轴
-    const double cex = std::cos(ex);
-    const double sex = std::sin(ex);
-    const double v2x = v1x;
-    const double v2y = v1y * cex + v1z * sex;
-    const double v2z = -v1y * sex + v1z * cex;
-
-    // 5) 解 yaw：cosψ 与 sinψ
-    const double denom = v2x*v2x + v2y*v2y;
-    const double eps = 1e-12;
-    if (denom < eps) {
-        // 退化：w 几乎在 z 轴上，yaw 不可观
-        return false;
-    }
-
-    const double cez = (v2z * (v2x * xp + v2y * yp)) / denom;
-    const double sez = (v2z * (-v2y * xp + v2x * yp)) / denom;
-
-    // 6) atan2 得到 yaw
-    yaw_out = std::atan2(sez, cez);
-    return std::isfinite(yaw_out);
+void PBA::anchor_camera_spherical_range2xyz() {
+	for (int i = 0; i < static_cast<int>(points.size()); ++i) {
+		const int nM = points[i].nM;
+		double bearing[3];
+		double point_camera[3];
+		double rotation_main[9];
+		double point_world_relative[3];
+		cep::cost::BearingFromAngles(
+			points[i].anchor_camera_spherical_range[0],
+			points[i].anchor_camera_spherical_range[1],
+			bearing);
+		point_camera[0] = bearing[0] * points[i].anchor_camera_spherical_range[2];
+		point_camera[1] = bearing[1] * points[i].anchor_camera_spherical_range[2];
+		point_camera[2] = bearing[2] * points[i].anchor_camera_spherical_range[2];
+		cep::cost::EulerToWorldToCamera(cams[nM].euler_angle, rotation_main);
+		cep::cost::MatTransposeVec(rotation_main, point_camera, point_world_relative);
+		points[i].xyz[0] = cams[nM].camera_center[0] + point_world_relative[0];
+		points[i].xyz[1] = cams[nM].camera_center[1] + point_world_relative[1];
+		points[i].xyz[2] = cams[nM].camera_center[2] + point_world_relative[2];
+	}
 }
-void PBA::get_yaw_from_polar(){
-	for (auto &kv : image_tracks) {
-		int view_idx = kv.first;
-		// double R[9];
-		double ey = cams[view_idx].euler_angle[0];
-		double ex = cams[view_idx].euler_angle[1];
-		double xc = cams[view_idx].camera_center[0];
-		double yc = cams[view_idx].camera_center[1];
-		double zc = cams[view_idx].camera_center[2];
-		// double c1 = cos(ey);
-		// double c2 = cos(ex);
-		// double s1 = sin(ey);
-		// double s2 = sin(ex);
-		// R[0]=c1;       R[1]=0;           R[2]=s1;
-		// R[3]=-s1*s2;   R[4]=c2;          R[5]=c1*s2;
-		// R[6]=-s1*c2;   R[7]=-s2;         R[8]=c1*c2;
-
-		double sum = 0;
-		int j=0;
-		auto &obs_list = kv.second;
-		for (auto &obs : obs_list) {
-			// double pa = obs.polar;
-			// double lc = obs.lightcone;
-			if(j==0){
-				int i = obs.feature_idx;
-				double 
-				x = points[i].xyz[0],
-				y = points[i].xyz[1],
-				z = points[i].xyz[2];
-
-				double u = obs.u;
-				double v = obs.v;
-				double fx = 0, fy = 0, cx = 0, cy = 0;
-				int cam_idx = cams[view_idx].camidx;
-				fx = intrs[cam_idx-1].fx;
-				fy = intrs[cam_idx-1].fy;
-				cx = intrs[cam_idx-1].cx;
-				cy = intrs[cam_idx-1].cy;
-
-				double yaw;
-				// printf("%f %f %f %f %f %f %f %f %f %f %f %f %f %f\n",u,v,fx,fy,cx,cy,xc,yc,zc,ey,ex,x,y,z);
-				SolveYawFromProjection(u,v,fx,fy,cx,cy,xc,yc,zc,ey,ex,x,y,z,yaw);
-				sum+=yaw;
-				j++;
-			}
-			else{
-				break;
-			}
+void PBA::anchor_camera_spherical_inverse_range2xyz() {
+	for (int i = 0; i < static_cast<int>(points.size()); ++i) {
+		const int nM = points[i].nM;
+		double rho = points[i].anchor_camera_spherical_inverse_range[2];
+		if (std::abs(rho) < 1e-12) {
+			rho = std::copysign(1e-12, rho == 0.0 ? 1.0 : rho);
 		}
-		cams[view_idx].euler_angle[2]=sum/j;
+		double bearing[3];
+		double point_camera[3];
+		double rotation_main[9];
+		double point_world_relative[3];
+		cep::cost::BearingFromAngles(
+			points[i].anchor_camera_spherical_inverse_range[0],
+			points[i].anchor_camera_spherical_inverse_range[1],
+			bearing);
+		point_camera[0] = bearing[0] / rho;
+		point_camera[1] = bearing[1] / rho;
+		point_camera[2] = bearing[2] / rho;
+		cep::cost::EulerToWorldToCamera(cams[nM].euler_angle, rotation_main);
+		cep::cost::MatTransposeVec(rotation_main, point_camera, point_world_relative);
+		points[i].xyz[0] = cams[nM].camera_center[0] + point_world_relative[0];
+		points[i].xyz[1] = cams[nM].camera_center[1] + point_world_relative[1];
+		points[i].xyz[2] = cams[nM].camera_center[2] + point_world_relative[2];
 	}
 }
-double PBA::costFuc(){
-	double R[9],u,v,fx,fy,cx,cy,ey,ex,ez,c1,c2,c3,s1,s2,s3,Xc[3],p[3],xp,yp,predicted_u,predicted_v,residuals[2],err=0;
-	int nobs=0,cam_idx,view_idx;
-	// int k1=0,k2=0;
-	for (auto &kv : image_tracks) {
-		// k1++;
-		// k2=0;
-		int view_idx = kv.first;
-		auto &obs_list = kv.second;
-		nobs+=obs_list.size();
-		for (auto &obs : obs_list) {
-			// k2++;
-			int i=obs.feature_idx;
-			u = obs.u;
-			v = obs.v;
-			cam_idx = cams[view_idx].camidx;
-			fx = intrs[cam_idx-1].fx;
-			fy = intrs[cam_idx-1].fy;
-			cx = intrs[cam_idx-1].cx;
-			cy = intrs[cam_idx-1].cy;
-			ey=cams[view_idx].euler_angle[0];
-			ex=cams[view_idx].euler_angle[1];
-			ez=cams[view_idx].euler_angle[2];
-			c1 = cos(ey);   c2 = cos(ex);   c3 = cos(ez);
-			s1 = sin(ey);   s2 = sin(ex);   s3 = sin(ez);
-			R[0]=c1*c3-s1*s2*s3;     R[1]=c2*s3;     R[2]=s1*c3+c1*s2*s3;
-			R[3]=-c1*s3-s1*s2*c3;    R[4]=c2*c3;     R[5]=-s1*s3+c1*s2*c3;
-			R[6]=-s1*c2;             R[7]=-s2;       R[8]=c1*c2;
-			Xc[0] = points[i].xyz[0] - cams[view_idx].camera_center[0];
-			Xc[1] = points[i].xyz[1] - cams[view_idx].camera_center[1];
-			Xc[2] = points[i].xyz[2] - cams[view_idx].camera_center[2];
-			p[0] = R[0] * Xc[0] + R[1] * Xc[1] + R[2] * Xc[2];//X
-			p[1] = R[3] * Xc[0] + R[4] * Xc[1] + R[5] * Xc[2];//Y
-			p[2] = R[6] * Xc[0] + R[7] * Xc[1] + R[8] * Xc[2];//Z
-			// Normalize
-			xp = p[0] / p[2];
-			yp = p[1] / p[2];
-
-			// Project
-			predicted_u = fx * xp + cx;
-			predicted_v = fy * yp + cy;
-
-			// if(k1==1 && k2==1){
-			// 	printf("%d %f %f %f %f %f %f\n",view_idx, cams[view_idx].euler_angle[0],cams[view_idx].euler_angle[1],cams[view_idx].euler_angle[2],
-			// 	cams[view_idx].camera_center[0],cams[view_idx].camera_center[1],cams[view_idx].camera_center[2]);
-			// 	printf("%d %f %f %f\n",i, points[i].xyz[0],points[i].xyz[1],points[i].xyz[2]);
-			// 	printf("%f %f\n",u,v);
-			// 	printf("%f %f\n\n",predicted_u,predicted_v);
-			// }
-			
-			// Residual
-			residuals[0] = predicted_u - u;
-			residuals[1] = predicted_v - v;
-			err+=(residuals[0]*residuals[0]+residuals[1]*residuals[1]);
+void PBA::parallax_camera2xyz() {
+	for (int i = 0; i < static_cast<int>(points.size()); ++i) {
+		const int nM = points[i].nM;
+		const int nA = points[i].nA;
+		double rotation_main[9];
+		double bearing_main[3];
+		double baseline_world[3] = {
+			cams[nA].camera_center[0] - cams[nM].camera_center[0],
+			cams[nA].camera_center[1] - cams[nM].camera_center[1],
+			cams[nA].camera_center[2] - cams[nM].camera_center[2],
+		};
+		double baseline_main[3];
+		cep::cost::EulerToWorldToCamera(cams[nM].euler_angle, rotation_main);
+		cep::cost::BearingFromAngles(
+			points[i].parallax_camera[0],
+			points[i].parallax_camera[1],
+			bearing_main);
+		cep::cost::MatVec(rotation_main, baseline_world, baseline_main);
+		const double baseline_norm = sqrt(
+			baseline_main[0] * baseline_main[0] +
+			baseline_main[1] * baseline_main[1] +
+			baseline_main[2] * baseline_main[2]);
+		if (baseline_norm < 1e-12) {
+			continue;
 		}
-	}
-	return sqrt(err/(2*nobs));
-}
-void PBA::randCam(ParameterType paramtype){
-	std::random_device rd;
-	std::mt19937 gen(rd()); 
-	std::uniform_real_distribution<double> dist1(-PI/4, PI/4),dist2(-PI/4,PI/4),dist3(-2*PI,2*PI),
-	dist4(-6,6),dist5(-2,2),dist6(-2,2);
-
-	string originalPath(m_szXYZ);
-	size_t pos = originalPath.find_last_of("/\\");
-	string parentPath = (pos != std::string::npos) ? originalPath.substr(0, pos) : "";
-	string ifeature_path = parentPath + "/Cam.txt";
-	if(ifeature_path.c_str()!=NULL){
-		FILE *fp = nullptr;
-		fopen_s(&fp, ifeature_path.c_str(), "w");
-		for(int i=0;i<cams.size();i++){
-			if(paramtype==rotation_translation){
-				cams[i].camera_center[0]=dist4(gen);
-				cams[i].camera_center[1]=dist5(gen);
-				cams[i].camera_center[2]=dist6(gen);
-			}
-			cams[i].euler_angle[0]=dist1(gen);
-			cams[i].euler_angle[1]=dist2(gen);
-			cams[i].euler_angle[2]=dist3(gen);
-			
-			fprintf(fp,"%lf %lf %lf %lf %lf %lf %d\n",cams[i].euler_angle[0],cams[i].euler_angle[1],cams[i].euler_angle[2],
-			cams[i].camera_center[0],cams[i].camera_center[1],cams[i].camera_center[2],cams[i].camidx);
+		const double cos_beta = clamp_acos_arg(
+			(bearing_main[0] * baseline_main[0] +
+			 bearing_main[1] * baseline_main[1] +
+			 bearing_main[2] * baseline_main[2]) /
+			baseline_norm);
+		const double beta = acos(cos_beta);
+		const double omega = points[i].parallax_camera[2];
+		double sin_omega = sin(omega);
+		if (std::abs(sin_omega) < 1e-12) {
+			sin_omega = std::copysign(1e-12, sin_omega == 0.0 ? 1.0 : sin_omega);
 		}
-		fclose(fp);
+		const double range =
+			baseline_norm * sin(beta + omega) / sin_omega;
+		double point_main[3] = {
+			range * bearing_main[0],
+			range * bearing_main[1],
+			range * bearing_main[2],
+		};
+		double point_world_relative[3];
+		cep::cost::MatTransposeVec(rotation_main, point_main, point_world_relative);
+		points[i].xyz[0] = cams[nM].camera_center[0] + point_world_relative[0];
+		points[i].xyz[1] = cams[nM].camera_center[1] + point_world_relative[1];
+		points[i].xyz[2] = cams[nM].camera_center[2] + point_world_relative[2];
 	}
 }
 bool PBA::ba_run(char* szCam,
@@ -753,763 +852,1057 @@ bool PBA::ba_run(char* szCam,
 	char* szReport,
 	char* szPose,
 	char* sz3D,
-    objectpointtype optype,
-    rotation3dtype r3dtype,
-    imagepointtype iptype,
-	parametertype paramtype,
-    manifoldtype manitype)
+    MethodId method,
+	BenchmarkOutputMode output_mode,
+	int point_condition_sample,
+	int schur_sample)
 {
-	m_szCameraInit = szCam;                                                       
-	m_szFeatures   = szFea;                                                       
-	m_szCalibration= szCalib;                                                     
-	m_szXYZ        = szXYZ;                                                                                                                                                                                                            
-	m_szCamePose   = szPose;                                                      
-	m_sz3Dpts      = sz3D;                                                        
-	m_szReport     = szReport;                                                    
+	m_last_metrics = BARunMetrics{};
+	m_szCameraInit = szCam;
+	m_szFeatures = szFea;
+	m_szCalibration = szCalib;
+	m_szXYZ = szXYZ;
+	m_szCamePose = szPose;
+	m_sz3Dpts = sz3D;
+	m_szReport = szReport;
 
-	const char* object_point_type;
-	const char* image_point_type;
-	const char* rotation_3d_type;
-	const char* parameter_type;
-	const char* manifold_type;
-	switch (optype)
-	{
-	case xyz:
-		object_point_type="xyz";break;
-	case xy_inverse_z:	
-		object_point_type="xy_inverse_z";break;
-	case depth:
-		object_point_type="depth";break;
-	case inverse_depth:
-		object_point_type="inverse_depth";break;
-	case archored_xyz:
-		object_point_type="archored_xyz";break;
-	case archored_xy_inverse_z:
-		object_point_type="archored_xy_inverse_z";break;
-	case archored_depth:
-		object_point_type="archored_depth";break;
-	case archored_inverse_depth:
-		object_point_type="archored_inverse_depth";break;
-	case parallax:
-		object_point_type="parallax";break;	
-	}
-	switch (r3dtype)
-	{
-	case euler_angle:
-		rotation_3d_type="euler_angle";break;
-	case axis_angle:
-		rotation_3d_type="angle_axis";break;
-	case quaternion:
-		rotation_3d_type="quaternion";break;
-	}
-	switch(iptype)
-	{
-	case uv:
-		image_point_type="uv";break;
-	case light_cone:
-		image_point_type="light_cone";break;
-	}
-	switch(paramtype)
-	{
-	case rotation_translation_landmark:
-		parameter_type="rotation_translation_landmark";break;
-	case rotation_landmark:
-		parameter_type="rotation_landmark";break;
-	case translation_landmark:
-		parameter_type="translation_landmark";break;
-	case rotation_translation:
-		parameter_type="rotation_translation";break;
-	case rotation:
-		parameter_type="rotation";break;
-	case translation:
-		parameter_type="translation";break;
-	case landmark:
-		parameter_type="landmark";break;
-	}
-	switch(manitype)
-	{
-	case lie:
-		manifold_type="lie";break;
-	case quaternion_manifold:
-		manifold_type="quaternion_manifold";break;
-	case sphere_manifold:
-		manifold_type="sphere_manifold";break;
-	case line_manifold:
-		manifold_type="line_manifold";break;
-	case euclidean_manifold:
-		manifold_type="euclidean_manifold";break;
-	case none:
-		manifold_type="none";break;
-	}
-	printf("%s\n",m_szXYZ);
-	printf("parameterization\n");
-	printf("%s %s %s %s %s\n","object point  |  ","3d rotation  |  ","image point  |  ","parameter  |  ","manifold");
-	printf("%s %s %s %s %s\n",object_point_type,rotation_3d_type,image_point_type,parameter_type,manifold_type);
+	const bool diagnostics = output_mode == BenchmarkOutputMode::Diagnostic;
+	const objectpointtype optype = method_object_point_type(method);
+	const char* method_name = method_id_name(method);
 
-	string str = string(object_point_type)+"_"+rotation_3d_type+"_"+image_point_type;
-	// narrow_test();
-	if(iptype==uv){
-		ba_initialize(m_szCameraInit, m_szFeatures, m_szCalibration, m_szXYZ); 
-		if(paramtype!=rotation_translation_landmark){
-			randCam(paramtype);//change euler angle or camera center and save as Cam.txt
-		}
-	}else if(iptype==light_cone){
-		ba_initialize(m_szCameraInit, m_szFeatures, m_szCalibration, m_szXYZ); 
+	if (diagnostics) {
+		printf("%s\n", m_szXYZ != nullptr ? m_szXYZ : "");
+		printf("object-point parameterization benchmark\n");
+		printf("method: %s\n", method_name);
 	}
-	
+
+	if (!ba_initialize(m_szCameraInit, m_szFeatures, m_szCalibration, m_szXYZ)) {
+		return false;
+	}
+
 	ceres::Problem problem;
-	ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
-	double initial_cost,final_cost,real_final_cost;
-	int nobs=0;
-	if(paramtype==rotation || paramtype==rotation_translation || paramtype==translation)
-	{
-		IFeature();
-		for (auto &kv : image_tracks) {
-			int view_idx = kv.first;
-			auto &obs_list = kv.second;
-			nobs+=obs_list.size();
-			for (auto &obs : obs_list) {
-				int i=obs.feature_idx;
-				double u = obs.u;
-				double v = obs.v;
-				double lco = obs.lightcone;
-				double fx = 0, fy = 0, cx = 0, cy = 0;
-				int cam_idx = cams[view_idx].camidx;
-				fx = intrs[cam_idx-1].fx;
-				fy = intrs[cam_idx-1].fy;
-				cx = intrs[cam_idx-1].cx;
-				cy = intrs[cam_idx-1].cy;
-				
-				/*Parameterization of image point*/
-				if(iptype==light_cone && r3dtype==euler_angle && paramtype==rotation_translation){
-					ceres::CostFunction *cost_function = lc_euler_angle_rc::Create(lco,points[i].xyz[0],points[i].xyz[1],points[i].xyz[2]);
-					problem.AddResidualBlock(
-						cost_function,
-						nullptr, //loss_function
-						&cams[view_idx].euler_angle[0],
-						&cams[view_idx].camera_center[0]);
-				}
-				else if(iptype==uv && r3dtype==euler_angle && paramtype==rotation_translation){
-					ceres::CostFunction *cost_function = uv_euler_angle_rc::Create(u, v, fx, fy, cx, cy, 
-																points[i].xyz[0],points[i].xyz[1],points[i].xyz[2]);
-					problem.AddResidualBlock(
-						cost_function,
-						nullptr,
-						&cams[view_idx].euler_angle[0],
-						&cams[view_idx].camera_center[0]);
-				}
-				else if(iptype==light_cone && r3dtype==euler_angle && paramtype==rotation){
-					ceres::CostFunction *cost_function = lc_euler_angle_r::Create(lco,
-						points[i].xyz[0],points[i].xyz[1],points[i].xyz[2],
-						cams[view_idx].camera_center[0],cams[view_idx].camera_center[1],cams[view_idx].camera_center[2]);
-					problem.AddResidualBlock(
-						cost_function,
-						nullptr, // loss_function
-						&cams[view_idx].euler_angle[0]);
-				}
-				else if(iptype==uv && r3dtype==euler_angle && paramtype==rotation){
-					ceres::CostFunction *cost_function = uv_euler_angle_r::Create(u, v, fx, fy, cx, cy, 
-												points[i].xyz[0],points[i].xyz[1],points[i].xyz[2],
-												cams[view_idx].camera_center[0],cams[view_idx].camera_center[1],cams[view_idx].camera_center[2]);
-					problem.AddResidualBlock(
-						cost_function,
-						nullptr,
-						&cams[view_idx].euler_angle[0]);
-				}
+	int nobs = 0;
+
+	for (int i = 0; i < static_cast<int>(tracks.size()); i++) {
+		const int nM = points[i].nM;
+		const int nA = points[i].nA;
+
+		for (int j = 0; j < tracks[i].nview; j++) {
+			const int nP = tracks[i].obss[j].view_idx;
+			const double u = tracks[i].obss[j].u;
+			const double v = tracks[i].obss[j].v;
+
+			if (nP < 0 || nP >= static_cast<int>(cams.size())) {
+				fprintf(stderr, "BA error: observation references invalid camera index %d\n", nP);
+				return false;
 			}
 
-		}
-		// if(iptype==light_cone){
-		// 	initial_cost=costFuc();
-		// }
-		initial_cost=costFuc();
-		// if(iptype == uv){
-		// 	initial_cost = lc_rep();
-		// }
-	}
-	else if(paramtype==rotation_translation_landmark){
-		if(manitype == lie){
-			auto se3manifold = new Sophus::Manifold<Sophus::SE3>();
-			// auto quat_manifold = new ceres::QuaternionManifold();
-			for (int i = 0; i < points.size();i++){
-				problem.AddParameterBlock(points[i].xyz, 3);
+			const int cam_idx = cams[nP].camidx;
+			if (cam_idx <= 0 || cam_idx > static_cast<int>(intrs.size())) {
+				fprintf(stderr, "BA error: camera %d references invalid calibration index %d\n", nP, cam_idx);
+				return false;
 			}
-			for (int i = 0; i < cams.size(); i++) {
-				problem.AddParameterBlock(cams[i].se3, 7, se3manifold);
-				// problem.AddParameterBlock(cams[i].quat, 4, quat_manifold);
-				// problem.AddParameterBlock(cams[i].translation, 3);
-			}
-		}
-		else if(manitype == quaternion_manifold){
-			auto quat_manifold = new ceres::QuaternionManifold();
-			for (int i = 0; i < points.size();i++){
-				problem.AddParameterBlock(points[i].xyz, 3);
-			}
-			for (int i = 0; i < cams.size(); i++) {
-				problem.AddParameterBlock(cams[i].quat, 4, quat_manifold);
-				problem.AddParameterBlock(cams[i].camera_center, 3);
-			}
-		}
 
-		for (int i = 0; i < tracks.size(); i++)
-		{ 
-			nobs += tracks[i].nview;
-			int nM = points[i].nM;
-			int nA = points[i].nA;
+			const double fx = intrs[cam_idx - 1].fx;
+			const double fy = intrs[cam_idx - 1].fy;
+			const double cx = intrs[cam_idx - 1].cx;
+			const double cy = intrs[cam_idx - 1].cy;
+			nobs++;
 
-			for (int j = 0; j < tracks[i].nview; j++)
-			{ 
-				int view_idx = tracks[i].obss[j].view_idx;
-				double u = tracks[i].obss[j].u;
-				double v = tracks[i].obss[j].v;
-				double fx = 0, fy = 0, cx = 0, cy = 0;
-				int cam_idx = cams[view_idx].camidx;
-				fx = intrs[cam_idx-1].fx;
-				fy = intrs[cam_idx-1].fy;
-				cx = intrs[cam_idx-1].cx;
-				cy = intrs[cam_idx-1].cy;
-		
-				int nP = view_idx;
-				double lco = atan(sqrt(((u - cx) / fx) * ((u - cx) / fx) + ((v - cy) / fy) * ((v - cy) / fy)));
-				double pol = atan2(u-cx,v-cy);
-				tracks[i].obss[j].lightcone=lco;
-				tracks[i].obss[j].polar=pol;
-				
-				/*Parameterization of object point*/
-				//Zero archor
-				if(optype==xyz && r3dtype==euler_angle && iptype==uv){
-					ceres::CostFunction *cost_function = xyz_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
+			switch (optype) {
+			case xyz: {
+				ceres::CostFunction* cost_function = xyz_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
+				problem.AddResidualBlock(cost_function, nullptr,
+					&cams[nP].euler_angle[0],
+					&cams[nP].camera_center[0],
+					&points[i].xyz[0]);
+				break;
+			}
+			case xy_inverse_z: {
+				ceres::CostFunction* cost_function = xy_inverse_z_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
+				problem.AddResidualBlock(cost_function, nullptr,
+					&cams[nP].euler_angle[0],
+					&cams[nP].camera_center[0],
+					&points[i].xy_inverse_z[0]);
+				break;
+			}
+			case depth: {
+				ceres::CostFunction* cost_function = depth_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
+				problem.AddResidualBlock(cost_function, nullptr,
+					&cams[nP].euler_angle[0],
+					&cams[nP].camera_center[0],
+					&points[i].world_depth[0]);
+				break;
+			}
+			case inverse_depth: {
+				ceres::CostFunction* cost_function = inverse_depth_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
+				problem.AddResidualBlock(cost_function, nullptr,
+					&cams[nP].euler_angle[0],
+					&cams[nP].camera_center[0],
+					&points[i].world_inverse_depth[0]);
+				break;
+			}
+			case anchor_camera_xyz: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraMainResidual<
+							cep::cost::kAnchorCameraXYZ>::Create(u, v, fx, fy, cx, cy);
 					problem.AddResidualBlock(
-						cost_function,
-						nullptr, 
-						&cams[view_idx].euler_angle[0],
-						&cams[view_idx].camera_center[0],
-						&points[i].xyz[0]);
+						cost_function, nullptr, &points[i].anchor_camera_xyz[0]);
+				} else {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraOtherResidual<
+							cep::cost::kAnchorCameraXYZ>::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].euler_angle[0],
+						&cams[nM].camera_center[0],
+						&points[i].anchor_camera_xyz[0]);
 				}
-				else if(optype==xy_inverse_z && r3dtype==euler_angle && iptype==uv){
-						ceres::CostFunction *cost_function = xy_inverse_z_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&points[i].xy_inverse_z[0]);
-				}
-				else if(optype==depth && r3dtype==euler_angle && iptype==uv){
-					ceres::CostFunction *cost_function = depth_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&points[i].world_depth[0]);
-				}
-				else if(optype==inverse_depth && r3dtype==euler_angle && iptype==uv){
-					ceres::CostFunction *cost_function = inverse_depth_euler_angle_uv::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&points[i].world_inverse_depth[0]);
-				}
-				
-				//One archor
-				if(optype==archored_xyz && r3dtype==euler_angle && iptype==uv){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = archored_xyz_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].euler_angle[0],
-							&points[i].archored_xyz[0]);
-					}else{
-						ceres::CostFunction *cost_function = archored_xyz_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].archored_xyz[0]);
-					}
-				}
-				else if(optype==archored_xy_inverse_z && r3dtype==euler_angle && iptype==uv){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = archored_xy_inverse_z_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].euler_angle[0],
-							&points[i].archored_xy_inverse_z[0]);
-					}else{
-						ceres::CostFunction *cost_function = archored_xy_inverse_z_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].archored_xy_inverse_z[0]);
-					}
-				}
-				else if(optype==archored_depth && r3dtype==euler_angle && iptype==uv){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = archored_depth_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].euler_angle[0],
-							&points[i].direction[0]);
-					}else{
-						ceres::CostFunction *cost_function = archored_depth_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].direction[0],
-							&points[i].depth);
-					}
-				}
-				else if(optype==archored_inverse_depth && r3dtype==euler_angle && iptype==uv){
-					// problem.AddParameterBlock(&points[i].idp[0], 3); 
-					if(nP==nM){
-						// std::vector<int> constant_parameters = {2};
-						// auto* subset_manifold = new ceres::SubsetManifold(3, constant_parameters);
-						// problem.SetManifold(&points[i].idp[0], subset_manifold);
-						ceres::CostFunction *cost_function = archored_inverse_depth_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].euler_angle[0],
-							&points[i].direction[0]);
-					}else{
-						ceres::CostFunction *cost_function = archored_inverse_depth_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].direction[0],
-							&points[i].inverse_depth);
-					}
-				}
-
-				//Two archors
-				if(optype==parallax && r3dtype==euler_angle && iptype==uv){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = parallax_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].euler_angle[0],
-							&points[i].direction[0]);
-					}else if(nP==nA){
-						ceres::CostFunction *cost_function = parallax_euler_angle_uv_nA::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}else{
-						ceres::CostFunction *cost_function = parallax_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].euler_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&cams[nA].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}
-				}
-
-				/*Parameterization of 3d rotation*/
-				//axis angle
-				if(optype==xyz && r3dtype==axis_angle && iptype==uv){
-						ceres::CostFunction *cost_function = axis_angle_xyz_uv::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].axis_angle[0],
-							&cams[nP].camera_center[0],
-							&points[i].xyz[0]);
-				}
-				else if(optype==xyz && r3dtype==quaternion && iptype==uv){
-						ceres::CostFunction *cost_function = quaternion_xyz_uv::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].quat[0],
-							&cams[nP].camera_center[0],
-							&points[i].xyz[0]);
-				}
-				//quaternion
-				if(optype==parallax && r3dtype==axis_angle && iptype==uv){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = axis_angle_parallax_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].axis_angle[0],
-							&points[i].direction[0]);
-					}else if(nP==nA){
-						ceres::CostFunction *cost_function = axis_angle_parallax_uv_nA::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].axis_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}else{
-						ceres::CostFunction *cost_function = axis_angle_parallax_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].axis_angle[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&cams[nA].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}
-				}
-				else if(optype==parallax && r3dtype==quaternion && iptype==uv){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = quaternion_parallax_uv_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].quat[0],
-							&points[i].direction[0]);
-					}else if(nP==nA){
-						ceres::CostFunction *cost_function = quaternion_parallax_uv_nA::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].quat[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}else{
-						ceres::CostFunction *cost_function = quaternion_parallax_uv_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].quat[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&cams[nA].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}
-				}
-				
-				/*Manifold*/
-				if(optype==xyz && iptype==uv && manitype==lie){
-					ceres::CostFunction *cost_function = xyz_uv_lie_manifold::Create(u, v, fx, fy, cx, cy);
+				break;
+			}
+			case anchor_camera_xy_inverse_z: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraMainResidual<
+							cep::cost::kAnchorCameraXYInverseZ>::Create(u, v, fx, fy, cx, cy);
 					problem.AddResidualBlock(
-						cost_function,
-						nullptr, // loss_function,
-						&cams[nP].se3[0],
-						&points[i].xyz[0]);
-					// problem.AddResidualBlock(
-					// 	cost_function,
-					// 	nullptr, // loss_function,
-					// 	&cams[nP].quat[0],
-					// 	&cams[nP].translation[0],
-					// 	&points[i].xyz[0]);
+						cost_function, nullptr, &points[i].anchor_camera_xy_inverse_z[0]);
+				} else {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraOtherResidual<
+							cep::cost::kAnchorCameraXYInverseZ>::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].euler_angle[0],
+						&cams[nM].camera_center[0],
+						&points[i].anchor_camera_xy_inverse_z[0]);
 				}
-				else if(optype==parallax&& iptype==uv && manitype==quaternion_manifold){
-					if(nP==nM){
-						ceres::CostFunction *cost_function = parallax_uv_quaternion_manifold_nM::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function,
-							&cams[nP].quat[0],
-							&points[i].direction[0]);
-					}else if(nP==nA){
-						ceres::CostFunction *cost_function = parallax_uv_quaternion_manifold_nA::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].quat[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}else{
-						ceres::CostFunction *cost_function = parallax_uv_quaternion_manifold_nP::Create(u, v, fx, fy, cx, cy);
-						problem.AddResidualBlock(
-							cost_function,
-							nullptr, //loss_function, 
-							&cams[nP].quat[0],
-							&cams[nP].camera_center[0],
-							&cams[nM].camera_center[0],
-							&cams[nA].camera_center[0],
-							&points[i].direction[0],
-							&points[i].parallax);
-					}
+				break;
+			}
+			case anchor_camera_spherical_range: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraMainResidual<
+							cep::cost::kAnchorCameraSphericalRange>::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(
+						cost_function, nullptr, &points[i].anchor_camera_spherical_range[0]);
+				} else {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraOtherResidual<
+							cep::cost::kAnchorCameraSphericalRange>::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].euler_angle[0],
+						&cams[nM].camera_center[0],
+						&points[i].anchor_camera_spherical_range[0]);
 				}
+				break;
+			}
+			case anchor_camera_spherical_inverse_range: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraMainResidual<
+							cep::cost::kAnchorCameraSphericalInverseRange>::Create(
+							u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(
+						cost_function, nullptr, &points[i].anchor_camera_spherical_inverse_range[0]);
+				} else {
+					ceres::CostFunction* cost_function =
+						cep::cost::AnchorCameraOtherResidual<
+							cep::cost::kAnchorCameraSphericalInverseRange>::Create(
+							u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].euler_angle[0],
+						&cams[nM].camera_center[0],
+						&points[i].anchor_camera_spherical_inverse_range[0]);
+				}
+				break;
+			}
+			case archored_xyz: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function = archored_xyz_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&points[i].archored_xyz[0]);
+				} else {
+					ceres::CostFunction* cost_function = archored_xyz_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].camera_center[0],
+						&points[i].archored_xyz[0]);
+				}
+				break;
+			}
+			case archored_xy_inverse_z: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function = archored_xy_inverse_z_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&points[i].archored_xy_inverse_z[0]);
+				} else {
+					ceres::CostFunction* cost_function = archored_xy_inverse_z_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].camera_center[0],
+						&points[i].archored_xy_inverse_z[0]);
+				}
+				break;
+			}
+			case archored_depth: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function = archored_depth_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&points[i].archored_spherical_range[0]);
+				} else {
+					ceres::CostFunction* cost_function = archored_depth_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].camera_center[0],
+						&points[i].archored_spherical_range[0]);
+				}
+				break;
+			}
+			case archored_inverse_depth: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function = archored_inverse_depth_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&points[i].archored_spherical_inverse_range[0]);
+				} else {
+					ceres::CostFunction* cost_function = archored_inverse_depth_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].camera_center[0],
+						&points[i].archored_spherical_inverse_range[0]);
+				}
+				break;
+			}
+			case parallax: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function = parallax_euler_angle_uv_nM::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&points[i].parallax_world[0]);
+				} else if (nP == nA) {
+					ceres::CostFunction* cost_function = parallax_euler_angle_uv_nA::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].camera_center[0],
+						&points[i].parallax_world[0]);
+				} else {
+					ceres::CostFunction* cost_function = parallax_euler_angle_uv_nP::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].camera_center[0],
+						&cams[nA].camera_center[0],
+						&points[i].parallax_world[0]);
+				}
+				break;
+			}
+			case parallax_camera: {
+				if (nP == nM) {
+					ceres::CostFunction* cost_function =
+						cep::cost::ParallaxCameraMainResidual::Create(u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(
+						cost_function, nullptr, &points[i].parallax_camera[0]);
+				} else if (nP == nA) {
+					ceres::CostFunction* cost_function =
+						cep::cost::ParallaxCameraAssociateResidual::Create(
+							u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].euler_angle[0],
+						&cams[nM].camera_center[0],
+						&points[i].parallax_camera[0]);
+				} else {
+					ceres::CostFunction* cost_function =
+						cep::cost::ParallaxCameraOtherResidual::Create(
+							u, v, fx, fy, cx, cy);
+					problem.AddResidualBlock(cost_function, nullptr,
+						&cams[nP].euler_angle[0],
+						&cams[nP].camera_center[0],
+						&cams[nM].euler_angle[0],
+						&cams[nM].camera_center[0],
+						&cams[nA].camera_center[0],
+						&points[i].parallax_camera[0]);
+				}
+				break;
+			}
+			default:
+				fprintf(stderr, "BA error: unsupported object-point method %s\n", method_name);
+				return false;
 			}
 		}
 	}
 
-	// double ini_err = lc_rep();
-	
-	std::vector<double> cost_per_iteration,cost_per_iteration1;
-	int num_cams = m_ncams;
-	std::vector<std::vector<double>> euler_history,euler_history1;
-	// Camera* cameras = new Camera[num_cams];
-	CostRecorderCallback* callback=NULL;
-	CostRecorderCallback_simple * callback_simple=NULL;
-	if(iptype==light_cone){
-		callback = new CostRecorderCallback(cost_per_iteration,euler_history,cams,num_cams);
-	}else if(iptype==uv){
-		callback_simple=new CostRecorderCallback_simple(cost_per_iteration);
+	if (nobs == 0) {
+		fprintf(stderr, "BA error: no observations were loaded\n");
+		return false;
 	}
-	printf("Ceres Options\n");
+
+	if (environment_flag("CEP_FIX_MONOCULAR_GAUGE", true) && !cams.empty()) {
+		if (problem.HasParameterBlock(&cams[0].euler_angle[0])) {
+			problem.SetParameterBlockConstant(&cams[0].euler_angle[0]);
+		}
+		if (problem.HasParameterBlock(&cams[0].camera_center[0])) {
+			problem.SetParameterBlockConstant(&cams[0].camera_center[0]);
+		}
+		int scale_camera = -1;
+		for (int camera_index = 1; camera_index < static_cast<int>(cams.size()); ++camera_index) {
+			if (!problem.HasParameterBlock(&cams[camera_index].camera_center[0])) {
+				continue;
+			}
+			double baseline_squared = 0.0;
+			for (int axis = 0; axis < 3; ++axis) {
+				const double component =
+					cams[camera_index].camera_center[axis] - cams[0].camera_center[axis];
+				baseline_squared += component * component;
+			}
+			if (baseline_squared > 1e-24) {
+				scale_camera = camera_index;
+				break;
+			}
+		}
+		if (scale_camera >= 0) {
+			int scale_axis = 0;
+			double maximum_baseline_component = 0.0;
+			for (int axis = 0; axis < 3; ++axis) {
+				const double component = std::abs(
+					cams[scale_camera].camera_center[axis] - cams[0].camera_center[axis]);
+				if (component > maximum_baseline_component) {
+					maximum_baseline_component = component;
+					scale_axis = axis;
+				}
+			}
+			problem.SetManifold(
+				&cams[scale_camera].camera_center[0],
+				new ceres::SubsetManifold(3, std::vector<int>{scale_axis}));
+		}
+	}
+
 	ceres::Solver::Options options;
 	options.logging_type = ceres::SILENT;
-	options.minimizer_progress_to_stdout = true;
-	options.num_threads = 8;
-	options.max_num_iterations = 100;  
-	// options.trust_region_strategy_type = ceres::DOGLEG;         
-	options.linear_solver_type = ceres::SPARSE_SCHUR;            
-	options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+	options.minimizer_progress_to_stdout = false;
+	const unsigned int hw_threads = std::thread::hardware_concurrency();
+	options.num_threads = environment_int(
+		"CEP_NUM_THREADS",
+		static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
+	options.max_num_iterations =
+		environment_int("CEP_MAX_NUM_ITERATIONS", 100);
+	options.linear_solver_type = ceres::SPARSE_SCHUR;
+	options.function_tolerance = environment_double(
+		"CEP_FUNCTION_TOLERANCE",
+		options.function_tolerance);
+	options.gradient_tolerance = environment_double(
+		"CEP_GRADIENT_TOLERANCE",
+		options.gradient_tolerance);
+	options.parameter_tolerance = environment_double(
+		"CEP_PARAMETER_TOLERANCE",
+		options.parameter_tolerance);
+	options.initial_trust_region_radius = environment_double(
+		"CEP_INITIAL_TRUST_REGION_RADIUS",
+		options.initial_trust_region_radius);
 
-	if(iptype==light_cone){
-		options.callbacks.push_back(callback);
-	}else if(iptype==uv){
-		options.callbacks.push_back(callback_simple);
+	std::vector<DiagnosticParameterBlock> diagnostic_parameter_blocks;
+	std::unique_ptr<StrictDiagnosticIterationCallback> strict_callback;
+	const bool strict_vector_diagnostics =
+		diagnostics && environment_flag("CEP_STRICT_VECTOR_DIAGNOSTICS", true);
+	if (strict_vector_diagnostics) {
+		diagnostic_parameter_blocks = collect_active_parameter_blocks(problem);
+		strict_callback = std::make_unique<StrictDiagnosticIterationCallback>(
+			diagnostic_parameter_blocks);
+		options.update_state_every_iteration = true;
+		options.callbacks.push_back(strict_callback.get());
 	}
-	
-	options.update_state_every_iteration = true; 
+
 	ceres::Solver::Summary summary;
 	ceres::Solve(options, &problem, &summary);
-	std::cout << summary.FullReport() << "\n";
 
-	// if(iptype==light_cone){
-	// 	printf("get yaw from polar\n");
-	// 	get_yaw_from_polar();
-	// 	final_cost= costFuc();
-	// }
-	final_cost= costFuc();
-	if(iptype == uv){
-		// final_cost = lc_rep();
+	const double initial_rmse = sqrt(2.0 * summary.initial_cost / nobs);
+	const double final_rmse = sqrt(2.0 * summary.final_cost / nobs);
+	const int iteration_count = static_cast<int>(summary.iterations.size() > 0 ? summary.iterations.size() - 1 : 0);
+	int accepted_steps = 0;
+	int rejected_steps = 0;
+	int total_linear_solver_iterations = 0;
+	for (const auto& iteration : summary.iterations) {
+		total_linear_solver_iterations += iteration.linear_solver_iterations;
+		if (iteration.iteration == 0) {
+			continue;
+		}
+		if (iteration.step_is_successful) {
+			++accepted_steps;
+		} else {
+			++rejected_steps;
+		}
 	}
-	else if(iptype == light_cone){
-		printf("get yaw from polar\n");
-		get_yaw_from_polar();
-		ceres::Problem problem1;
-		for (auto &kv : image_tracks) {
-			int view_idx = kv.first;
-			auto &obs_list = kv.second;
-			for (auto &obs : obs_list) {
-				int i=obs.feature_idx;
-				double u = obs.u;
-				double v = obs.v;
-				double fx = 0, fy = 0, cx = 0, cy = 0;
-				int cam_idx = cams[view_idx].camidx;
-				fx = intrs[cam_idx-1].fx;
-				fy = intrs[cam_idx-1].fy;
-				cx = intrs[cam_idx-1].cx;
-				cy = intrs[cam_idx-1].cy;
-				if(paramtype==rotation){
-					ceres::CostFunction *cost_function = uv_euler_angle_r::Create(u, v, fx, fy, cx, cy, 
-									points[i].xyz[0],points[i].xyz[1],points[i].xyz[2],
-									cams[view_idx].camera_center[0],cams[view_idx].camera_center[1],cams[view_idx].camera_center[2]);
-					problem1.AddResidualBlock(
-						cost_function,
-						nullptr,
-						&cams[view_idx].euler_angle[0]);
+	double final_gradient_max_norm = 0.0;
+	double final_gradient_norm = 0.0;
+	if (!summary.iterations.empty()) {
+		final_gradient_max_norm = summary.iterations.back().gradient_max_norm;
+		final_gradient_norm = summary.iterations.back().gradient_norm;
+	}
+	StrictDiagnosticMetrics strict_metrics;
+	if (diagnostics && m_szReport != nullptr) {
+		const std::string parent = diagnostic_parent_directory(m_szReport);
+		const std::vector<DiagnosticIterationState> empty_states;
+		strict_metrics = write_strict_diagnostics(
+			problem,
+			diagnostic_parameter_blocks,
+			strict_callback ? strict_callback->states() : empty_states,
+			summary,
+			nobs,
+			options.gradient_tolerance,
+			parent);
+	}
+
+	m_last_metrics.success = summary.IsSolutionUsable();
+	m_last_metrics.cameras = m_ncams;
+	m_last_metrics.points = m_n3Dpts;
+	m_last_metrics.observations = nobs;
+	m_last_metrics.iterations = iteration_count;
+	m_last_metrics.accepted_steps = accepted_steps;
+	m_last_metrics.rejected_steps = rejected_steps;
+	m_last_metrics.linear_solver_iterations = total_linear_solver_iterations;
+	m_last_metrics.termination_type = static_cast<int>(summary.termination_type);
+	m_last_metrics.initial_cost = summary.initial_cost;
+	m_last_metrics.final_cost = summary.final_cost;
+	m_last_metrics.initial_rmse_px = initial_rmse;
+	m_last_metrics.final_rmse_px = final_rmse;
+	m_last_metrics.initial_gradient_max_norm =
+		strict_metrics.initial_gradient_max_norm;
+	m_last_metrics.final_gradient_max_norm = final_gradient_max_norm;
+	m_last_metrics.final_gradient_norm = final_gradient_norm;
+	m_last_metrics.gradient_reduction_ratio_final =
+		strict_metrics.final_gradient_reduction_ratio;
+	m_last_metrics.reached_gradient_tolerance =
+		strict_metrics.reached_gradient_tolerance;
+	m_last_metrics.iterations_to_gradient_tolerance =
+		strict_metrics.iterations_to_gradient_tolerance;
+	m_last_metrics.final_relative_function_decrease =
+		strict_metrics.final_relative_function_decrease;
+	m_last_metrics.final_relative_step_size =
+		strict_metrics.final_relative_step_size;
+	m_last_metrics.final_lm_gain_ratio = strict_metrics.final_lm_gain_ratio;
+	m_last_metrics.final_gradient_lipschitz_estimate =
+		strict_metrics.final_gradient_lipschitz_estimate;
+	m_last_metrics.final_direction_quality =
+		strict_metrics.final_direction_quality;
+	m_last_metrics.solver_time_sec = summary.total_time_in_seconds;
+	m_last_metrics.linear_solver_time_sec = summary.linear_solver_time_in_seconds;
+
+	if (diagnostics && point_condition_sample > 0 && m_szReport != nullptr) {
+		const std::string report_path(m_szReport);
+		const size_t separator = report_path.find_last_of("/\\");
+		const std::string parent =
+			separator == std::string::npos ? "." : report_path.substr(0, separator);
+		const std::string conditioning_path =
+			parent + "/point_block_conditioning.csv";
+		FILE* fp = nullptr;
+		fopen_s(&fp, conditioning_path.c_str(), "w");
+		if (fp != nullptr) {
+			fprintf(fp,
+				"point_index,track_observations,jacobian_rows,jacobian_cols,"
+				"eigen_min,eigen_mid,eigen_max,condition_number,numerical_rank\n");
+			const int point_count = static_cast<int>(points.size());
+			const int sample_count = std::min(point_condition_sample, point_count);
+			for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
+				const int point_index = sample_count == 1
+					? 0
+					: static_cast<int>(
+						(static_cast<long long>(sample_index) * (point_count - 1)) /
+						(sample_count - 1));
+
+				std::vector<double*> parameter_blocks;
+				switch (optype) {
+				case xyz:
+					parameter_blocks.push_back(&points[point_index].xyz[0]);
+					break;
+				case xy_inverse_z:
+					parameter_blocks.push_back(&points[point_index].xy_inverse_z[0]);
+					break;
+				case depth:
+					parameter_blocks.push_back(&points[point_index].world_depth[0]);
+					break;
+				case inverse_depth:
+					parameter_blocks.push_back(&points[point_index].world_inverse_depth[0]);
+					break;
+				case archored_xyz:
+					parameter_blocks.push_back(&points[point_index].archored_xyz[0]);
+					break;
+				case archored_xy_inverse_z:
+					parameter_blocks.push_back(&points[point_index].archored_xy_inverse_z[0]);
+					break;
+				case archored_depth:
+					parameter_blocks.push_back(
+						&points[point_index].archored_spherical_range[0]);
+					break;
+				case archored_inverse_depth:
+					parameter_blocks.push_back(
+						&points[point_index].archored_spherical_inverse_range[0]);
+					break;
+				case parallax:
+					parameter_blocks.push_back(&points[point_index].parallax_world[0]);
+					break;
+				case anchor_camera_xyz:
+					parameter_blocks.push_back(&points[point_index].anchor_camera_xyz[0]);
+					break;
+				case anchor_camera_xy_inverse_z:
+					parameter_blocks.push_back(&points[point_index].anchor_camera_xy_inverse_z[0]);
+					break;
+				case anchor_camera_spherical_range:
+					parameter_blocks.push_back(
+						&points[point_index].anchor_camera_spherical_range[0]);
+					break;
+				case anchor_camera_spherical_inverse_range:
+					parameter_blocks.push_back(
+						&points[point_index].anchor_camera_spherical_inverse_range[0]);
+					break;
+				case parallax_camera:
+					parameter_blocks.push_back(&points[point_index].parallax_camera[0]);
+					break;
+				default:
+					break;
 				}
-				else if(paramtype==rotation_translation){
-					ceres::CostFunction *cost_function = uv_euler_angle_rc::Create(u, v, fx, fy, cx, cy, 
-											points[i].xyz[0],points[i].xyz[1],points[i].xyz[2]);
-					problem1.AddResidualBlock(
-						cost_function,
-						nullptr,
-						&cams[view_idx].euler_angle[0],
-						&cams[view_idx].camera_center[0]);
+
+				std::set<ceres::ResidualBlockId> residual_set;
+				for (double* parameter_block : parameter_blocks) {
+					std::vector<ceres::ResidualBlockId> residual_blocks;
+					problem.GetResidualBlocksForParameterBlock(
+						parameter_block, &residual_blocks);
+					residual_set.insert(residual_blocks.begin(), residual_blocks.end());
+				}
+				if (parameter_blocks.empty() || residual_set.empty()) {
+					continue;
+				}
+
+				ceres::Problem::EvaluateOptions evaluation_options;
+				evaluation_options.apply_loss_function = false;
+				evaluation_options.num_threads = 1;
+				evaluation_options.parameter_blocks = parameter_blocks;
+				evaluation_options.residual_blocks.assign(
+					residual_set.begin(), residual_set.end());
+				ceres::CRSMatrix jacobian;
+				if (!problem.Evaluate(
+						evaluation_options, nullptr, nullptr, nullptr, &jacobian) ||
+					jacobian.num_cols != 3) {
+					continue;
+				}
+
+				Eigen::MatrixXd dense_jacobian =
+					Eigen::MatrixXd::Zero(jacobian.num_rows, jacobian.num_cols);
+				for (int row = 0; row < jacobian.num_rows; ++row) {
+					for (int entry = jacobian.rows[row];
+						 entry < jacobian.rows[row + 1];
+						 ++entry) {
+						dense_jacobian(row, jacobian.cols[entry]) =
+							jacobian.values[entry];
+					}
+				}
+				const Eigen::Matrix3d point_hessian =
+					dense_jacobian.transpose() * dense_jacobian;
+				const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigensolver(
+					point_hessian);
+				if (eigensolver.info() != Eigen::Success) {
+					continue;
+				}
+				const Eigen::Vector3d eigenvalues = eigensolver.eigenvalues();
+				const double eigen_max = eigenvalues[2];
+				const double rank_threshold =
+					std::max(1e-18, std::abs(eigen_max) * 1e-12);
+				int numerical_rank = 0;
+				for (int eigen_index = 0; eigen_index < 3; ++eigen_index) {
+					if (eigenvalues[eigen_index] > rank_threshold) {
+						++numerical_rank;
+					}
+				}
+				const double condition_number =
+					eigenvalues[0] > rank_threshold
+						? eigen_max / eigenvalues[0]
+						: std::numeric_limits<double>::infinity();
+				fprintf(fp,
+					"%d,%d,%d,%d,%.15lf,%.15lf,%.15lf,%.15lf,%d\n",
+					point_index,
+					tracks[point_index].nview,
+					jacobian.num_rows,
+					jacobian.num_cols,
+					eigenvalues[0],
+					eigenvalues[1],
+					eigenvalues[2],
+					condition_number,
+					numerical_rank);
+			}
+			fclose(fp);
+		}
+	}
+
+	if (diagnostics && schur_sample > 0 && m_szReport != nullptr) {
+		const std::string report_path(m_szReport);
+		const size_t separator = report_path.find_last_of("/\\");
+		const std::string parent =
+			separator == std::string::npos ? "." : report_path.substr(0, separator);
+		const int point_count = static_cast<int>(points.size());
+		const int sample_count = std::min(schur_sample, point_count);
+
+		std::vector<double*> sampled_point_blocks;
+		std::set<double*> sampled_point_block_set;
+		std::set<ceres::ResidualBlockId> residual_set;
+		for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
+			const int point_index = sample_count == 1
+				? 0
+				: static_cast<int>(
+					(static_cast<long long>(sample_index) * (point_count - 1)) /
+					(sample_count - 1));
+			std::vector<double*> point_blocks;
+			switch (optype) {
+			case xyz:
+				point_blocks.push_back(&points[point_index].xyz[0]);
+				break;
+			case xy_inverse_z:
+				point_blocks.push_back(&points[point_index].xy_inverse_z[0]);
+				break;
+			case depth:
+				point_blocks.push_back(&points[point_index].world_depth[0]);
+				break;
+			case inverse_depth:
+				point_blocks.push_back(&points[point_index].world_inverse_depth[0]);
+				break;
+			case archored_xyz:
+				point_blocks.push_back(&points[point_index].archored_xyz[0]);
+				break;
+			case archored_xy_inverse_z:
+				point_blocks.push_back(&points[point_index].archored_xy_inverse_z[0]);
+				break;
+			case archored_depth:
+				point_blocks.push_back(
+					&points[point_index].archored_spherical_range[0]);
+				break;
+			case archored_inverse_depth:
+				point_blocks.push_back(
+					&points[point_index].archored_spherical_inverse_range[0]);
+				break;
+			case parallax:
+				point_blocks.push_back(&points[point_index].parallax_world[0]);
+				break;
+			case anchor_camera_xyz:
+				point_blocks.push_back(&points[point_index].anchor_camera_xyz[0]);
+				break;
+			case anchor_camera_xy_inverse_z:
+				point_blocks.push_back(&points[point_index].anchor_camera_xy_inverse_z[0]);
+				break;
+			case anchor_camera_spherical_range:
+				point_blocks.push_back(
+					&points[point_index].anchor_camera_spherical_range[0]);
+				break;
+			case anchor_camera_spherical_inverse_range:
+				point_blocks.push_back(
+					&points[point_index].anchor_camera_spherical_inverse_range[0]);
+				break;
+			case parallax_camera:
+				point_blocks.push_back(&points[point_index].parallax_camera[0]);
+				break;
+			default:
+				break;
+			}
+			for (double* point_block : point_blocks) {
+				if (sampled_point_block_set.insert(point_block).second) {
+					sampled_point_blocks.push_back(point_block);
+				}
+			std::vector<ceres::ResidualBlockId> point_residual_blocks;
+			problem.GetResidualBlocksForParameterBlock(
+				point_block, &point_residual_blocks);
+			residual_set.insert(
+				point_residual_blocks.begin(), point_residual_blocks.end());
+			}
+		}
+
+		std::vector<double*> camera_blocks;
+		std::set<double*> camera_block_set;
+		for (ceres::ResidualBlockId residual_block : residual_set) {
+			std::vector<double*> residual_parameter_blocks;
+			problem.GetParameterBlocksForResidualBlock(
+				residual_block, &residual_parameter_blocks);
+			for (double* parameter_block : residual_parameter_blocks) {
+				if (problem.IsParameterBlockConstant(parameter_block) ||
+					problem.ParameterBlockTangentSize(parameter_block) <= 0) {
+					continue;
+				}
+				if (sampled_point_block_set.count(parameter_block) == 0 &&
+					camera_block_set.insert(parameter_block).second) {
+					camera_blocks.push_back(parameter_block);
 				}
 			}
 		}
-		
-		CostRecorderCallback* callback = new CostRecorderCallback(cost_per_iteration1,euler_history1,cams,num_cams);
-		printf("total refine\n");
-		ceres::Solver::Options options;
-		options.logging_type = ceres::SILENT;
-		options.minimizer_progress_to_stdout = true;
-		options.num_threads = 8;
-		options.max_num_iterations = 100;  
-		// options.trust_region_strategy_type = ceres::DOGLEG;         
-		options.linear_solver_type = ceres::SPARSE_SCHUR;            
-		options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
 
-		options.callbacks.push_back(callback);
-		options.update_state_every_iteration = true; 
-		ceres::Solver::Summary summary;
-		ceres::Solve(options, &problem1, &summary);
-		std::cout << summary.FullReport() << "\n";
-		real_final_cost= costFuc();
-	}
-	
-	// // printf("%f %s %f\n", ini_err, " to ", fin_err);
+		int camera_dimension = 0;
+		for (double* camera_block : camera_blocks) {
+			camera_dimension += problem.ParameterBlockTangentSize(camera_block);
+		}
+		int point_dimension = 0;
+		for (double* point_block : sampled_point_blocks) {
+			if (problem.IsParameterBlockConstant(point_block) ||
+				problem.ParameterBlockTangentSize(point_block) <= 0) {
+				continue;
+			}
+			point_dimension += problem.ParameterBlockTangentSize(point_block);
+		}
 
-	string originalPath(m_szXYZ);
-	size_t pos = originalPath.find_last_of("/\\");
-	string parentPath = (pos != std::string::npos) ? originalPath.substr(0, pos) : "";
-	string converge_curve = parentPath + "/convergence_" + str + ".txt";
-	string opt_point = parentPath + "/XYZ_" + str + ".ply";
-	string opt_cam = parentPath + "/Cam_" + str + ".txt";
-	if(opt_cam.c_str()!=NULL){
-		FILE *fp = nullptr;
-		fopen_s(&fp, opt_cam.c_str(), "w");
-		if(r3dtype==axis_angle){
-			for(int i=0;i<cams.size();i++){
-				axis2euc(cams[i].axis_angle,cams[i].euler_angle);
+		if (!camera_blocks.empty() && !sampled_point_blocks.empty() &&
+			!residual_set.empty() && camera_dimension > 0 && point_dimension > 0) {
+			ceres::Problem::EvaluateOptions evaluation_options;
+			evaluation_options.apply_loss_function = false;
+			evaluation_options.num_threads = 1;
+			evaluation_options.parameter_blocks = camera_blocks;
+			evaluation_options.parameter_blocks.insert(
+				evaluation_options.parameter_blocks.end(),
+				sampled_point_blocks.begin(),
+				sampled_point_blocks.end());
+			evaluation_options.residual_blocks.assign(
+				residual_set.begin(), residual_set.end());
+
+			ceres::CRSMatrix jacobian;
+			if (problem.Evaluate(
+					evaluation_options, nullptr, nullptr, nullptr, &jacobian) &&
+				jacobian.num_cols == camera_dimension + point_dimension) {
+				Eigen::MatrixXd dense_jacobian =
+					Eigen::MatrixXd::Zero(jacobian.num_rows, jacobian.num_cols);
+				for (int row = 0; row < jacobian.num_rows; ++row) {
+					for (int entry = jacobian.rows[row];
+						 entry < jacobian.rows[row + 1];
+						 ++entry) {
+						dense_jacobian(row, jacobian.cols[entry]) =
+							jacobian.values[entry];
+					}
+				}
+				const Eigen::MatrixXd normal_matrix =
+					dense_jacobian.transpose() * dense_jacobian;
+				const Eigen::MatrixXd camera_hessian =
+					normal_matrix.topLeftCorner(camera_dimension, camera_dimension);
+				const Eigen::MatrixXd cross_hessian =
+					normal_matrix.topRightCorner(camera_dimension, point_dimension);
+				const Eigen::MatrixXd point_hessian =
+					normal_matrix.bottomRightCorner(point_dimension, point_dimension);
+				const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd>
+					point_solver(point_hessian);
+				Eigen::MatrixXd reduced_camera =
+					camera_hessian -
+					cross_hessian * point_solver.solve(cross_hessian.transpose());
+				reduced_camera =
+					0.5 * (reduced_camera + reduced_camera.transpose());
+
+				const Eigen::JacobiSVD<Eigen::MatrixXd> svd(reduced_camera);
+				const Eigen::VectorXd singular_values = svd.singularValues();
+				if (singular_values.size() > 0) {
+					const double sigma_max = singular_values[0];
+					constexpr double rank_relative_tolerance = 1e-8;
+					const double rank_threshold =
+						std::max(
+							1e-18,
+							std::abs(sigma_max) * rank_relative_tolerance);
+					int numerical_rank = 0;
+					double sigma_min_nonzero = 0.0;
+					for (int singular_index = 0;
+						 singular_index < singular_values.size();
+						 ++singular_index) {
+						if (singular_values[singular_index] > rank_threshold) {
+							++numerical_rank;
+							sigma_min_nonzero = singular_values[singular_index];
+						}
+					}
+					const int nullity = camera_dimension - numerical_rank;
+					const double condition_number =
+						sigma_min_nonzero > 0.0
+							? sigma_max / sigma_min_nonzero
+							: std::numeric_limits<double>::infinity();
+
+					const std::string summary_path = parent + "/schur_summary.csv";
+					FILE* fp = nullptr;
+					fopen_s(&fp, summary_path.c_str(), "w");
+					if (fp != nullptr) {
+						fprintf(fp,
+							"sampled_points,residual_blocks,camera_parameter_blocks,"
+							"point_parameter_blocks,camera_dimension,point_dimension,"
+							"numerical_rank,nullity,sigma_max,sigma_min_nonzero,"
+							"condition_number,rank_relative_tolerance,rank_threshold\n");
+						fprintf(fp,
+							"%d,%d,%d,%d,%d,%d,%d,%d,%.15lf,%.15lf,%.15lf,"
+							"%.15lf,%.15lf\n",
+							sample_count,
+							static_cast<int>(residual_set.size()),
+							static_cast<int>(camera_blocks.size()),
+							static_cast<int>(sampled_point_blocks.size()),
+							camera_dimension,
+							point_dimension,
+							numerical_rank,
+							nullity,
+							sigma_max,
+							sigma_min_nonzero,
+							condition_number,
+							rank_relative_tolerance,
+							rank_threshold);
+						fclose(fp);
+					}
+
+					const std::string spectrum_path = parent + "/schur_spectrum.csv";
+					fopen_s(&fp, spectrum_path.c_str(), "w");
+					if (fp != nullptr) {
+						fprintf(fp, "index,singular_value,normalized_singular_value\n");
+						for (int singular_index = 0;
+							 singular_index < singular_values.size();
+							 ++singular_index) {
+							const double normalized =
+								sigma_max > 0.0
+									? singular_values[singular_index] / sigma_max
+									: 0.0;
+							fprintf(fp,
+								"%d,%.15lf,%.15lf\n",
+								singular_index,
+								singular_values[singular_index],
+								normalized);
+						}
+						fclose(fp);
+					}
+				}
 			}
 		}
-		if(r3dtype==quaternion){
-			for(int i=0;i<cams.size();i++){
-				q2euc(cams[i].quat,cams[i].euler_angle);
-			}
-		}
-		for (int i = 0; i < cams.size(); i++){
-			fprintf(fp, "%lf %lf %lf %lf %lf %lf\n", cams[i].euler_angle[0], cams[i].euler_angle[1], cams[i].euler_angle[2],
-			                             cams[i].camera_center[0],cams[i].camera_center[1],cams[i].camera_center[2]);
-		}
-		fclose(fp);
 	}
-	//save features xyz
-	if (opt_point.c_str() != NULL){
-		FILE *fp = nullptr;
-		fopen_s(&fp, opt_point.c_str(), "w");
-		fprintf(fp, "%s\n", "ply");
-		fprintf(fp, "%s\n", "format ascii 1.0");
-		fprintf(fp, "%s %d\n", "element vertex", m_n3Dpts);
-		fprintf(fp, "%s\n", "property float x");
-		fprintf(fp, "%s\n", "property float y");
-		fprintf(fp, "%s\n", "property float z");
-		fprintf(fp, "%s\n", "end_header");
-	
-		//zero archor
-		if(optype==xy_inverse_z){
+
+	if (diagnostics) {
+		std::cout << summary.BriefReport() << "\n";
+		printf("%s %.12lf %s %.12lf\n", "RMSE(px):", initial_rmse, "to", final_rmse);
+	}
+
+	if (diagnostics && m_szCamePose != nullptr) {
+		FILE* fp = nullptr;
+		fopen_s(&fp, m_szCamePose, "w");
+		if (fp != nullptr) {
+			for (int i = 0; i < static_cast<int>(cams.size()); i++) {
+				fprintf(fp, "%.15lf %.15lf %.15lf %.15lf %.15lf %.15lf %d\n",
+					cams[i].euler_angle[0], cams[i].euler_angle[1], cams[i].euler_angle[2],
+					cams[i].camera_center[0], cams[i].camera_center[1], cams[i].camera_center[2],
+					cams[i].camidx);
+			}
+			fclose(fp);
+		}
+	}
+
+	if (diagnostics && m_sz3Dpts != nullptr) {
+		if (optype == xy_inverse_z) {
 			xy_inverse_z2xyz();
-		}else if(optype==depth){
+		} else if (optype == depth) {
 			depth2xyz();
-		}else if(optype==inverse_depth){
+		} else if (optype == inverse_depth) {
 			inverse_depth2xyz();
-		}
-
-		//one archor
-		if(optype==archored_xyz){
+		} else if (optype == archored_xyz) {
 			archored_xyz2xyz();
-		}else if(optype==archored_xy_inverse_z){
+		} else if (optype == archored_xy_inverse_z) {
 			archored_xy_inverse_z2xyz();
-		}else if(optype==archored_depth){
+		} else if (optype == archored_depth) {
 			archored_depth2xyz();
-		}else if(optype==archored_inverse_depth){
+		} else if (optype == archored_inverse_depth) {
 			archored_inverse_depth2xyz();
-		}
-
-		//two archors
-		if(optype==parallax){
+		} else if (optype == parallax) {
 			parallax2xyz();
+		} else if (optype == anchor_camera_xyz) {
+			anchor_camera_xyz2xyz();
+		} else if (optype == anchor_camera_xy_inverse_z) {
+			anchor_camera_xy_inverse_z2xyz();
+		} else if (optype == anchor_camera_spherical_range) {
+			anchor_camera_spherical_range2xyz();
+		} else if (optype == anchor_camera_spherical_inverse_range) {
+			anchor_camera_spherical_inverse_range2xyz();
+		} else if (optype == parallax_camera) {
+			parallax_camera2xyz();
 		}
 
-		for (int i = 0; i < points.size(); i++)
-			fprintf(fp, "%lf %lf %lf\n", points[i].xyz[0], points[i].xyz[1], points[i].xyz[2]);
-		fclose(fp);
-	}
-
-	// printf("%d\n",num_cams);
-	if(converge_curve.c_str()!=NULL){
-		FILE *fp=nullptr;
-		fopen_s(&fp,converge_curve.c_str(),"w");
-		for (int i = 0; i < cost_per_iteration.size(); ++i) {
-			if(iptype==light_cone){
-				for(int j=0;j<num_cams;j++){
-					cams[j].euler_angle[0] = euler_history[i][j*6 + 0];
-					cams[j].euler_angle[1] = euler_history[i][j*6 + 1];
-					cams[j].euler_angle[2] = euler_history[i][j*6 + 2];
-					if(paramtype==rotation_translation){
-						cams[j].camera_center[0] = euler_history[i][j*6 + 3];
-						cams[j].camera_center[1] = euler_history[i][j*6 + 4];
-						cams[j].camera_center[2] = euler_history[i][j*6 + 5];
-					}
-				}
-				// printf("%d %f\n",i,euler_history[i][0]);
-				double cost = costFuc();
-				fprintf(fp, "%d %lf\n", i, cost);
-			}else{
-				fprintf(fp, "%d %lf\n", i, sqrt(cost_per_iteration[i]/nobs));
+		FILE* fp = nullptr;
+		fopen_s(&fp, m_sz3Dpts, "w");
+		if (fp != nullptr) {
+			fprintf(fp, "%s\n", "ply");
+			fprintf(fp, "%s\n", "format ascii 1.0");
+			fprintf(fp, "%s %d\n", "element vertex", m_n3Dpts);
+			fprintf(fp, "%s\n", "property float x");
+			fprintf(fp, "%s\n", "property float y");
+			fprintf(fp, "%s\n", "property float z");
+			fprintf(fp, "%s\n", "end_header");
+			for (int i = 0; i < static_cast<int>(points.size()); i++) {
+				fprintf(fp, "%.15lf %.15lf %.15lf\n", points[i].xyz[0], points[i].xyz[1], points[i].xyz[2]);
 			}
-
-			// fprintf(fp, "%d %lf %lf\n", i, cost,sqrt(cost_per_iteration[i]/nobs));
-			
-		}
-		if(iptype==light_cone){
-			for (int i = 0; i < cost_per_iteration1.size(); ++i) {
-				for(int j=0;j<num_cams;j++){
-					cams[j].euler_angle[0] = euler_history1[i][j*6 + 0];
-					cams[j].euler_angle[1] = euler_history1[i][j*6 + 1];
-					cams[j].euler_angle[2] = euler_history1[i][j*6 + 2];
-					if(paramtype==rotation_translation){
-						cams[j].camera_center[0] = euler_history1[i][j*6 + 3];
-						cams[j].camera_center[1] = euler_history1[i][j*6 + 4];
-						cams[j].camera_center[2] = euler_history1[i][j*6 + 5];
-					}
-				}
-				// printf("%d %f\n",i,euler_history[i][0]);
-				double cost = costFuc();
-				// fprintf(fp, "%d %lf\n", i, sqrt(cost_per_iteration[i]/nobs));
-				// fprintf(fp, "%d %lf %lf\n", i+cost_per_iteration.size(), cost,sqrt(cost_per_iteration1[i]/nobs));
-				fprintf(fp, "%d %lf\n", i+cost_per_iteration.size(), cost);
-			}
+			fclose(fp);
 		}
 	}
-	if(iptype == uv){
-		// printf("%f %s %f\n", initial_cost, " to ", final_cost);
-		initial_cost = summary.initial_cost;
-		final_cost = summary.final_cost;
-		printf("%f %s %f\n", sqrt(initial_cost/nobs), " to ", sqrt(final_cost/nobs));
-	}
-	if(iptype == light_cone)
-	{
-		// initial_cost = summary.initial_cost;
-		// final_cost = summary.final_cost;
-		// printf("%f %s %f\n", sqrt(initial_cost/nobs), " to ", sqrt(final_cost/nobs));
-		printf("%f %s %f %s %f\n", initial_cost, " to ", final_cost," to ",real_final_cost);
-	}
-	// if(iptype==light_cone){
-		
-	// }else{
-		// initial_cost = summary.initial_cost;
-		// final_cost = summary.final_cost;
-		// printf("%f %s %f\n", sqrt(initial_cost/nobs), " to ", sqrt(final_cost/nobs));
-	// }
-	// // printf("%f %s %f\n", initial_cost*2/nobs, " to ", final_cost*2/nobs);
-	// printf("%f %s %f\n", sqrt(initial_cost/nobs), " to ", sqrt(final_cost/nobs));
 
-	return true;
+	if (diagnostics && m_szReport != nullptr) {
+		std::string report_path(m_szReport);
+		FILE* fp = nullptr;
+		fopen_s(&fp, report_path.c_str(), "w");
+		if (fp != nullptr) {
+			fprintf(fp, "method %s\n", method_name);
+			fprintf(fp, "cameras %d\n", m_ncams);
+			fprintf(fp, "points %d\n", m_n3Dpts);
+			fprintf(fp, "observations %d\n", nobs);
+			fprintf(fp, "initial_cost %.15lf\n", summary.initial_cost);
+			fprintf(fp, "final_cost %.15lf\n", summary.final_cost);
+			fprintf(fp, "initial_rmse_px %.15lf\n", initial_rmse);
+			fprintf(fp, "final_rmse_px %.15lf\n", final_rmse);
+			fprintf(fp, "iterations %d\n", iteration_count);
+			fprintf(fp, "accepted_steps %d\n", accepted_steps);
+			fprintf(fp, "rejected_steps %d\n", rejected_steps);
+			fprintf(fp, "initial_gradient_max_norm %.15lf\n",
+				strict_metrics.initial_gradient_max_norm);
+			fprintf(fp, "final_gradient_max_norm %.15lf\n", final_gradient_max_norm);
+			fprintf(fp, "final_gradient_norm %.15lf\n", final_gradient_norm);
+			fprintf(fp, "gradient_reduction_ratio_final %.15lf\n",
+				strict_metrics.final_gradient_reduction_ratio);
+			fprintf(fp, "reached_gradient_tolerance %d\n",
+				strict_metrics.reached_gradient_tolerance);
+			fprintf(fp, "iterations_to_gradient_tolerance %d\n",
+				strict_metrics.iterations_to_gradient_tolerance);
+			fprintf(fp, "final_relative_function_decrease %.15lf\n",
+				strict_metrics.final_relative_function_decrease);
+			fprintf(fp, "final_relative_step_size %.15lf\n",
+				strict_metrics.final_relative_step_size);
+			fprintf(fp, "final_lm_gain_ratio %.15lf\n",
+				strict_metrics.final_lm_gain_ratio);
+			fprintf(fp, "final_gradient_lipschitz_estimate %.15lf\n",
+				strict_metrics.final_gradient_lipschitz_estimate);
+			fprintf(fp, "final_direction_quality %.15lf\n",
+				strict_metrics.final_direction_quality);
+			fprintf(fp, "linear_solver_iterations %d\n", total_linear_solver_iterations);
+			fprintf(fp, "solver_time_sec %.15lf\n", summary.total_time_in_seconds);
+			fprintf(fp, "linear_solver_time_sec %.15lf\n", summary.linear_solver_time_in_seconds);
+			fprintf(fp, "termination_type %d\n", static_cast<int>(summary.termination_type));
+			fprintf(fp, "brief_report %s\n", summary.BriefReport().c_str());
+			fclose(fp);
+		}
+
+		const size_t pos = report_path.find_last_of("/\\");
+		const std::string parent = (pos == std::string::npos) ? "." : report_path.substr(0, pos);
+		const std::string metrics_path = parent + "/metrics.json";
+		fopen_s(&fp, metrics_path.c_str(), "w");
+		if (fp != nullptr) {
+			fprintf(fp, "{\n");
+			fprintf(fp, "  \"method\": \"%s\",\n", method_name);
+			fprintf(fp, "  \"mode\": \"diagnostic\",\n");
+			fprintf(fp, "  \"ceres_version\": \"%s\",\n", CERES_VERSION_STRING);
+			fprintf(fp, "  \"solver\": {\n");
+			fprintf(fp, "    \"trust_region_strategy\": \"LEVENBERG_MARQUARDT\",\n");
+			fprintf(fp, "    \"linear_solver\": \"SPARSE_SCHUR\",\n");
+			fprintf(fp, "    \"robust_loss\": \"none\",\n");
+			fprintf(fp, "    \"max_num_iterations\": %d,\n", options.max_num_iterations);
+			fprintf(fp, "    \"num_threads\": %d,\n", options.num_threads);
+			fprintf(fp, "    \"function_tolerance\": %.17g,\n", options.function_tolerance);
+			fprintf(fp, "    \"gradient_tolerance\": %.17g,\n", options.gradient_tolerance);
+			fprintf(fp, "    \"parameter_tolerance\": %.17g,\n", options.parameter_tolerance);
+			fprintf(fp, "    \"min_relative_decrease\": %.17g,\n", options.min_relative_decrease);
+			fprintf(fp, "    \"initial_trust_region_radius\": %.17g,\n",
+				options.initial_trust_region_radius);
+			fprintf(fp, "    \"jacobi_scaling\": %s\n",
+				options.jacobi_scaling ? "true" : "false");
+			fprintf(fp, "  },\n");
+			fprintf(fp, "  \"problem\": {\n");
+			fprintf(fp, "    \"cameras\": %d,\n", m_ncams);
+			fprintf(fp, "    \"points\": %d,\n", m_n3Dpts);
+			fprintf(fp, "    \"observations\": %d\n", nobs);
+			fprintf(fp, "  },\n");
+			fprintf(fp, "  \"result\": {\n");
+			fprintf(fp, "    \"success\": %s,\n",
+				m_last_metrics.success ? "true" : "false");
+			fprintf(fp, "    \"initial_cost\": %.17g,\n", summary.initial_cost);
+			fprintf(fp, "    \"final_cost\": %.17g,\n", summary.final_cost);
+			fprintf(fp, "    \"initial_rmse_px\": %.17g,\n", initial_rmse);
+			fprintf(fp, "    \"final_rmse_px\": %.17g,\n", final_rmse);
+			fprintf(fp, "    \"iterations\": %d,\n", iteration_count);
+			fprintf(fp, "    \"accepted_steps\": %d,\n", accepted_steps);
+			fprintf(fp, "    \"rejected_steps\": %d,\n", rejected_steps);
+			fprintf(fp, "    \"solver_time_sec\": %.17g,\n",
+				summary.total_time_in_seconds);
+			fprintf(fp, "    \"linear_solver_time_sec\": %.17g,\n",
+				summary.linear_solver_time_in_seconds);
+			fprintf(fp, "    \"initial_gradient_max_norm\": %.17g,\n",
+				strict_metrics.initial_gradient_max_norm);
+			fprintf(fp, "    \"final_gradient_max_norm\": %.17g,\n",
+				final_gradient_max_norm);
+			fprintf(fp, "    \"final_gradient_norm\": %.17g,\n",
+				final_gradient_norm);
+			fprintf(fp, "    \"gradient_reduction_ratio_final\": %.17g,\n",
+				strict_metrics.final_gradient_reduction_ratio);
+			fprintf(fp, "    \"reached_gradient_tolerance\": %s,\n",
+				strict_metrics.reached_gradient_tolerance ? "true" : "false");
+			fprintf(fp, "    \"iterations_to_gradient_tolerance\": %d,\n",
+				strict_metrics.iterations_to_gradient_tolerance);
+			fprintf(fp, "    \"final_relative_function_decrease\": %.17g,\n",
+				strict_metrics.final_relative_function_decrease);
+			fprintf(fp, "    \"final_relative_step_size\": %.17g,\n",
+				strict_metrics.final_relative_step_size);
+			fprintf(fp, "    \"final_lm_gain_ratio\": %.17g,\n",
+				strict_metrics.final_lm_gain_ratio);
+			fprintf(fp, "    \"final_gradient_lipschitz_estimate\": %.17g,\n",
+				strict_metrics.final_gradient_lipschitz_estimate);
+			fprintf(fp, "    \"final_direction_quality\": %.17g,\n",
+				strict_metrics.final_direction_quality);
+			fprintf(fp, "    \"termination_type\": %d\n",
+				static_cast<int>(summary.termination_type));
+			fprintf(fp, "  },\n");
+			fprintf(fp, "  \"diagnostics\": {\n");
+			fprintf(fp, "    \"strict_vector_diagnostics\": %s,\n",
+				strict_metrics.vector_metrics_available ? "true" : "false");
+			fprintf(fp, "    \"point_condition_sample\": %d,\n",
+				std::max(0, point_condition_sample));
+			fprintf(fp, "    \"schur_sample\": %d\n", std::max(0, schur_sample));
+			fprintf(fp, "  }\n");
+			fprintf(fp, "}\n");
+			fclose(fp);
+		}
+	}
+
+	return m_last_metrics.success;
 }
 
 bool PBA::ba_initialize( char* szCamera, char* szFeature,  char* szCalib, char* szXYZ )
 {
 	// printf("BA: Bundle Adjustment Version 1.0\n");
 	FILE* fp = nullptr;
+
+	free(m_archor); m_archor = nullptr;
+	free(m_photo); m_photo = nullptr;
+	free(m_feature); m_feature = nullptr;
+	free(m_motstruct); m_motstruct = nullptr;
+	free(m_imgpts); m_imgpts = nullptr;
+	free(m_XYZ); m_XYZ = nullptr;
+	free(m_K); m_K = nullptr;
+	free(m_V); m_V = nullptr;
+	free(m_vmask); m_vmask = nullptr;
+	free(m_umask); m_umask = nullptr;
+	free(m_smask); m_smask = nullptr;
+	free(m_imgptsSum); m_imgptsSum = nullptr;
+	free(m_struct); m_struct = nullptr;
+	free(m_pnt2main); m_pnt2main = nullptr;
+	free(m_archorSort); m_archorSort = nullptr;
+	free(m_KR); m_KR = nullptr;
+	free(m_KdA); m_KdA = nullptr;
+	free(m_KdB); m_KdB = nullptr;
+	free(m_KdG); m_KdG = nullptr;
+	free(m_P); m_P = nullptr;
+	points.clear();
+	cams.clear();
+	tracks.clear();
+	intrs.clear();
+	m_bProvideXYZ = false;
+	m_bFocal = false;
 
 	//must input initial initial camera pose file and projection image points file
 	fopen_s(&fp, szCamera, "r" );
@@ -1568,11 +1961,9 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 	int frameno;
 	int feastart = 0;
 
-	int nP, nP2;
-	
 	double* ptr1 = projs;
 
-	int i, j; 
+	int i;
 	int  sum, cnp = 6;
 
 	int nFlag;
@@ -1580,13 +1971,7 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 	int *ptr2;
 	bool bAdjust;	
 
-	m_smask = (char*)malloc(m_ncams*m_ncams*sizeof(char));
-	memset( m_smask, 0, m_ncams*m_ncams*sizeof(char) );
-
-	int* archorEx = new int[m_n3Dpts*2];
-
 	bool bM, bN;
-	int max_nframes = -1;
 	//read all projection point, initialize three feature angle at the same time
 	while(!feof(fp))
 	{
@@ -1597,6 +1982,7 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 
 		Track track;
 		track.nview = nframes;
+		track.obss.reserve(nframes);
 
 		archor[ptno*3] = nframes;
 		cur = 0;
@@ -1647,16 +2033,12 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 				{
 					archor[ptno*3+1] = *(nphoto+feastart+ptr2[0]);
 					archor[ptno*3+2] = *(nphoto+feastart+ptr2[1]);
-
-					archorEx[ptno*2] = ptr2[0];
-					archorEx[ptno*2+1] = ptr2[1];
 				}
 				sum++;
 			}
 
 			if ( bM && !bN )
 			{	
-				bool bLast = (i == nframes-1);
 				bool bT = pba_initializeAssoArchor( 
 					projs+feastart*2,	
 					nphoto+feastart,	
@@ -1665,8 +2047,7 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 					m_motstruct+m_ncams*cnp+ptno*3,
 					0,
 					1,
-					ptno,
-					bLast );
+					ptno );
 
 				if (bT)
 				{
@@ -1674,15 +2055,12 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 					archor[ptno*3+2] = nphoto[count];
 					sum++;
 
-					archorEx[ptno*2+1] = i;
-
 					bN = true;
 				}
 			}
 
 			if ( !bM )
 			{
-				bool bLast = (i == nframes-2);
 				bool bT = pba_initializeMainArchor( 
 					projs+feastart*2,	
 					m_motstruct,		
@@ -1695,66 +2073,14 @@ void PBA::pba_readProjectionAndInitilizeFeature(FILE *fp,
 				archorSort[ptno*2] = i;
 				archor[ptno*3+1] = nphoto[count];
 				sum++;
-
-				archorEx[ptno*2] = i;
 				bM = true;
 			}	
 			count++;	
 		}
 
 		tracks.push_back(track);
-		//set masks for U and S matrix             
-		for( i = 0; i < nframes; i++ )
-		{
-			nP = nphoto[feastart+i];                         
-			int nM_ = archor[ptno * 3 + 1];
-			int nA_ = archor[ptno * 3 + 2];
-			int tmp3 = archor[ptno * 3 + 3];
-			
-			if (nM_<nP)                         
-				umask[nM_*(ncams)+nP] = 1;
-			else                                             
-				umask[nP*(ncams)+nM_] = 1;
-
-			
-			if (nA_<nP)                         
-				umask[nA_*(ncams)+nP] = 1;
-			else                                             
-				umask[nP*(ncams)+nA_] = 1;
-
-			umask[nP*ncams+nP] = 1;
-
-			for ( j = i; j < nframes; j++  )
-			{
-				nP2 = nphoto[feastart+j];                
-
-				if ( nP == nP2 )                              
-					m_smask[nP*m_ncams+nP2] = 1;
-				else if ( nP < nP2 )
-					m_smask[nP*m_ncams+nP2] = 1;
-				else
-				{
-					m_smask[nP2*m_ncams + nP] = 1;
-				}
-					
-			}
-		}					
 		feastart += nframes;
 		ptno++;
-	}
-
-
-	// count number of non-zero element in S matrix
-	m_nS = 0;
-	for ( i = 0; i < m_ncams; i++ ) 
-	{
-		for (j = 0; j < m_ncams; j++)
-		{
-			if (m_smask[i*m_ncams + j] == 1)
-			{
-				m_nS++;
-			}
-		}
 	}
 }
 
@@ -1774,10 +2100,13 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 	fopen_s(&fpc, camsfname, "r" );
 	*ncams	=	findNcameras( fpc );
 	m_ncams =	*ncams;
+	cams.reserve(m_ncams);
 	m_V = (int*)malloc(sizeof(int) * m_ncams);
 
 	fopen_s(&fpp, ptsfname, "r" );
 	readNpointsAndNprojections( fpp, n3Dpts, 3, n2Dprojs, 2 );
+	points.reserve(*n3Dpts);
+	tracks.reserve(*n3Dpts);
 
 	*motstruct = (double*)malloc((*ncams * 6 + *n3Dpts * 3) * sizeof(double));
 	if(	*motstruct==NULL )
@@ -1796,17 +2125,17 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 	rewind(fpc);
 	rewind(fpp);
 
-	//allocate indicator of U
-	*umask = (char*)malloc(*ncams * *ncams );
-	memset(*umask, 0, *ncams * *ncams * sizeof(char));
+	*vmask = nullptr;
+	*umask = nullptr;
 
 	//allocate main and associate anchors
 	*archor = (int*)malloc(*n3Dpts*3*sizeof(int));//
 	memset(*archor, -1, *n3Dpts * 3 * sizeof(int)); 
 
-	*nphoto		= (int*)malloc(*n2Dprojs*3*sizeof(int));//
-	*nfeature	= (int*)malloc(*n2Dprojs*3*sizeof(int));//
-	*archorSort = (int*)malloc(*n3Dpts*3*sizeof(int));
+	*nphoto		= (int*)malloc(*n2Dprojs*sizeof(int));//
+	*nfeature	= (int*)malloc(*n2Dprojs*sizeof(int));//
+	*archorSort = (int*)malloc(*n3Dpts*2*sizeof(int));
+	memset(*archorSort, -1, *n3Dpts * 2 * sizeof(int));
 
 	ba_readCameraPose(fpc, *motstruct, m_V);
 
@@ -1816,11 +2145,8 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 	
 	//Update KR
 	m_KR  = (double*)malloc(m_ncams*9*sizeof(double));
-	m_KdA = (double*)malloc(m_ncams*9*sizeof(double));
-	m_KdB = (double*)malloc(m_ncams*9*sizeof(double));
-	m_KdG = (double*)malloc(m_ncams*9*sizeof(double));
 	
-	ba_updateKR(m_KR, m_KdA, m_KdB, m_KdG, m_K, *motstruct);
+	ba_updateKR(m_KR, nullptr, nullptr, nullptr, m_K, *motstruct);
 
 	//if XYZ are provided, we can use them as feature initialization.
 	// fprintf(stdout, "%s\n", m_bProvideXYZ ? "true" : "false");  
@@ -1831,7 +2157,10 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 		m_XYZ = (double*)malloc(m_n3Dpts*3*sizeof(double));
 
 		for( i = 0; i < m_n3Dpts; i++){
-			fscanf_s(fpXYZ, "%lf  %lf  %lf", m_XYZ + i * 3, m_XYZ + i * 3 + 1, m_XYZ + i * 3 + 2);
+			if (fscanf_s(fpXYZ, "%lf  %lf  %lf", m_XYZ + i * 3, m_XYZ + i * 3 + 1, m_XYZ + i * 3 + 2) != 3) {
+				fprintf(stderr, "BA error: Format of XYZ initialization file is wrong\n");
+				exit(1);
+			}
 
 			Point3D p3d;
 			p3d.xyz[0] = m_XYZ[i * 3];
@@ -1845,27 +2174,6 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 		// }
 
 		fclose(fpXYZ);
-
-		string originalPath(m_szXYZ);
-		size_t pos = originalPath.find_last_of("/\\");
-		string parentPath = (pos != std::string::npos) ? originalPath.substr(0, pos) : "";
-		string init3D = parentPath + "/" + "XYZ.ply";
-		//save features xyz
-		if (init3D.c_str() != NULL)
-		{
-			FILE *fp = nullptr;
-			fopen_s(&fp, init3D.c_str(), "w");
-			fprintf(fp, "%s\n", "ply");
-			fprintf(fp, "%s\n", "format ascii 1.0");
-			fprintf(fp, "%s %d\n", "element vertex", m_n3Dpts);
-			fprintf(fp, "%s\n", "property float x");
-			fprintf(fp, "%s\n", "property float y");
-			fprintf(fp, "%s\n", "property float z");
-			fprintf(fp, "%s\n", "end_header");
-			for (i = 0; i < m_n3Dpts; i++)
-				fprintf(fp, "%lf %lf %lf\n", m_XYZ[i * 3], m_XYZ[i * 3 + 1], m_XYZ[i * 3 + 2]);
-			fclose(fp);
-		}
 	}
 
 
@@ -1883,7 +2191,6 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 	fclose(fpp);
 
 	
-	int nCount = 0;
 	double pti2k[3];
 	int cur = 0;
 
@@ -1909,7 +2216,7 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 			pti2k[2] = ptA[2] - ptMain[2];
 
 			double dispti2k;
-			dispti2k = sqrt(pti2k[0] * pti2k[0] + pti2k[1] * pti2k[1] + pti2k[2] * pti2k[2]);//����ģ��
+			dispti2k = sqrt(pti2k[0] * pti2k[0] + pti2k[1] * pti2k[1] + pti2k[2] * pti2k[2]);
 
 			ptMain[0] = m_XYZ[i * 3 + 0] - ptMain[0];
 			ptMain[1] = m_XYZ[i * 3 + 1] - ptMain[1];
@@ -1922,11 +2229,6 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 			dW1 = ptMain[0] * ptMain[0] + ptMain[1] * ptMain[1] + ptMain[2] * ptMain[2];
 
 			dW2 = ptA[0] * ptA[0] + ptA[1] * ptA[1] + ptA[2] * ptA[2];
-
-			double disDot2;
-			disDot2 = ptMain[0] * pti2k[0] + ptMain[1] * pti2k[1] + ptMain[2] * pti2k[2]; 
-			double dww = disDot2 / (dispti2k * sqrt(dW1));
-
 
 			double* pKR = m_KR + nM * 9;
 			double n[2], n2[2], ptXj[3];
@@ -1960,10 +2262,8 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 			//printf("%f %f\n", err1, err2);
 			cur += m_archor[i * 3];
 
-			if ((sqrt(dW1) / sqrt(dW2) > 30) || (err1 > err2) && (m_archor[3 * i] == 2))
+			if ((dW1 > 900.0 * dW2) || (err1 > err2) && (m_archor[3 * i] == 2))
 			{
-				nCount++;
-
 				m_archor[i*3+1] = nN;
 				m_archor[i*3+2] = nM;
 
@@ -1983,6 +2283,54 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 			}	
 		}
 	}
+	pba_applyAnchorPolicyAblation(*motstruct + *ncams * 6);
+	if (!m_bProvideXYZ) {
+		points.resize(m_n3Dpts);
+		for (i = 0; i < m_n3Dpts; ++i) {
+			Point3D& point = points[i];
+			point.nM = m_archor[i * 3 + 1];
+			point.nA = m_archor[i * 3 + 2];
+			point.parallax_world[0] = (*motstruct)[m_ncams * 6 + i * 3];
+			point.parallax_world[1] = (*motstruct)[m_ncams * 6 + i * 3 + 1];
+			point.parallax_world[2] = (*motstruct)[m_ncams * 6 + i * 3 + 2];
+
+			const int nM = point.nM;
+			const int nA = point.nA;
+			double bearing[3] = {
+				sin(point.parallax_world[0]) * cos(point.parallax_world[1]),
+				sin(point.parallax_world[1]),
+				cos(point.parallax_world[0]) * cos(point.parallax_world[1])
+			};
+			double range = 1.0;
+			if (nM >= 0 && nM < m_ncams && nA >= 0 && nA < m_ncams && nA != nM) {
+				double baseline[3] = {
+					cams[nA].camera_center[0] - cams[nM].camera_center[0],
+					cams[nA].camera_center[1] - cams[nM].camera_center[1],
+					cams[nA].camera_center[2] - cams[nM].camera_center[2]
+				};
+				const double baseline_norm = sqrt(
+					baseline[0] * baseline[0] +
+					baseline[1] * baseline[1] +
+					baseline[2] * baseline[2]);
+				const double omega = point.parallax_world[2];
+				const double sin_omega = sin(omega);
+				if (baseline_norm > 1e-12 && std::abs(sin_omega) > 1e-12) {
+					const double beta = acos(clamp_acos_arg(
+						(bearing[0] * baseline[0] +
+						 bearing[1] * baseline[1] +
+						 bearing[2] * baseline[2]) / baseline_norm));
+					const double candidate_range =
+						baseline_norm * sin(beta + omega) / sin_omega;
+					if (std::isfinite(candidate_range) && candidate_range > 1e-9) {
+						range = candidate_range;
+					}
+				}
+			}
+			point.xyz[0] = cams[nM].camera_center[0] + range * bearing[0];
+			point.xyz[1] = cams[nM].camera_center[1] + range * bearing[1];
+			point.xyz[2] = cams[nM].camera_center[2] + range * bearing[2];
+		}
+	}
 	double x,y,z;
 	for (int i = 0; i < points.size();i++){
 		x=points[i].xyz[0];
@@ -2000,152 +2348,429 @@ void PBA::pba_readAndInitialize(char *camsfname, char *ptsfname,char *calibfname
 
 		points[i].nM = m_archor[i * 3 + 1];
 		points[i].nA = m_archor[i * 3 + 2];
-		points[i].direction[0] = (*motstruct)[m_ncams * 6 + i * 3];
-		points[i].direction[1] = (*motstruct)[m_ncams * 6 + i * 3 + 1];
-		points[i].parallax = (*motstruct)[m_ncams * 6 + i * 3 + 2];
+		const double initial_parallax =
+			(*motstruct)[m_ncams * 6 + i * 3 + 2];
 
 		int nM = points[i].nM;
 		double dx = points[i].xyz[0] - cams[nM].camera_center[0];
 		double dy = points[i].xyz[1] - cams[nM].camera_center[1];
 		double dz = points[i].xyz[2] - cams[nM].camera_center[2];
 		double d = sqrt(dx * dx + dy * dy + dz * dz);
-		points[i].inverse_depth = 1 / d;
-		points[i].depth = d;
+		const double world_azimuth = atan2(dx, dz);
+		const double world_elevation =
+			atan2(dy, sqrt(dx * dx + dz * dz));
+		double safe_dz = std::abs(dz) < 1e-12
+			? std::copysign(1e-12, dz == 0.0 ? 1.0 : dz)
+			: dz;
+		double safe_z = std::abs(points[i].xyz[2]) < 1e-12
+			? std::copysign(1e-12, points[i].xyz[2] == 0.0 ? 1.0 : points[i].xyz[2])
+			: points[i].xyz[2];
+		points[i].parallax_world[0] = world_azimuth;
+		points[i].parallax_world[1] = world_elevation;
+		points[i].parallax_world[2] = initial_parallax;
+		points[i].archored_spherical_range[0] = world_azimuth;
+		points[i].archored_spherical_range[1] = world_elevation;
+		points[i].archored_spherical_range[2] = d;
+		points[i].archored_spherical_inverse_range[0] = world_azimuth;
+		points[i].archored_spherical_inverse_range[1] = world_elevation;
+		points[i].archored_spherical_inverse_range[2] = 1 / d;
 		points[i].archored_xyz[0] = dx;
 		points[i].archored_xyz[1] = dy;
 		points[i].archored_xyz[2] = dz;
 
-		points[i].archored_xy_inverse_z[0] = dx;
-		points[i].archored_xy_inverse_z[1] = dy;
-		points[i].archored_xy_inverse_z[2] = 1/dz;
+		points[i].archored_xy_inverse_z[0] = dx / safe_dz;
+		points[i].archored_xy_inverse_z[1] = dy / safe_dz;
+		points[i].archored_xy_inverse_z[2] = 1 / safe_dz;
 
-		points[i].xy_inverse_z[0] = points[i].xyz[0];
-		points[i].xy_inverse_z[1] = points[i].xyz[1];
-		points[i].xy_inverse_z[2] = 1/points[i].xyz[2];
+		points[i].xy_inverse_z[0] = points[i].xyz[0] / safe_z;
+		points[i].xy_inverse_z[1] = points[i].xyz[1] / safe_z;
+		points[i].xy_inverse_z[2] = 1 / safe_z;
+
+		double rotation_main[9];
+		double point_world_relative[3] = {dx, dy, dz};
+		double point_camera[3];
+		cep::cost::EulerToWorldToCamera(cams[nM].euler_angle, rotation_main);
+		cep::cost::MatVec(rotation_main, point_world_relative, point_camera);
+		const double camera_range = sqrt(
+			point_camera[0] * point_camera[0] +
+			point_camera[1] * point_camera[1] +
+			point_camera[2] * point_camera[2]);
+		const double safe_camera_z = std::abs(point_camera[2]) < 1e-12
+			? std::copysign(1e-12, point_camera[2] == 0.0 ? 1.0 : point_camera[2])
+			: point_camera[2];
+		const double camera_azimuth = atan2(point_camera[0], point_camera[2]);
+		const double camera_elevation = atan2(
+			point_camera[1],
+			sqrt(point_camera[0] * point_camera[0] + point_camera[2] * point_camera[2]));
+
+		points[i].anchor_camera_xyz[0] = point_camera[0];
+		points[i].anchor_camera_xyz[1] = point_camera[1];
+		points[i].anchor_camera_xyz[2] = point_camera[2];
+		points[i].anchor_camera_xy_inverse_z[0] = point_camera[0] / safe_camera_z;
+		points[i].anchor_camera_xy_inverse_z[1] = point_camera[1] / safe_camera_z;
+		points[i].anchor_camera_xy_inverse_z[2] = 1 / safe_camera_z;
+		points[i].anchor_camera_spherical_range[0] = camera_azimuth;
+		points[i].anchor_camera_spherical_range[1] = camera_elevation;
+		points[i].anchor_camera_spherical_range[2] = camera_range;
+		points[i].anchor_camera_spherical_inverse_range[0] = camera_azimuth;
+		points[i].anchor_camera_spherical_inverse_range[1] = camera_elevation;
+		points[i].anchor_camera_spherical_inverse_range[2] = 1 / camera_range;
+		points[i].parallax_camera[0] = camera_azimuth;
+		points[i].parallax_camera[1] = camera_elevation;
+		points[i].parallax_camera[2] = initial_parallax;
 	}
-	for (int i = 0; i < cams.size();i++){
-		double R[9], q[4], axis_angle[3], t[3];
-		double ey = cams[i].euler_angle[0];
-		double ex = cams[i].euler_angle[1];
-		double ez = cams[i].euler_angle[2];
-		double c1 = cos(ey), c2 = cos(ex), c3 = cos(ez);
-		double s1 = sin(ey), s2 = sin(ex), s3 = sin(ez);
-		R[0]=c1*c3-s1*s2*s3;     R[1]=c2*s3;     R[2]=s1*c3+c1*s2*s3;
-		R[3]=-c1*s3-s1*s2*c3;    R[4]=c2*c3;     R[5]=-s1*s3+c1*s2*c3;
-		R[6]=-s1*c2;             R[7]=-s2;       R[8]=c1*c2;
-		t[0] = -R[0] * cams[i].camera_center[0] - R[1] * cams[i].camera_center[1] - R[2] * cams[i].camera_center[2];
-		t[1] = -R[3] * cams[i].camera_center[0] - R[4] * cams[i].camera_center[1] - R[5] * cams[i].camera_center[2];
-		t[2] = -R[6] * cams[i].camera_center[0] - R[7] * cams[i].camera_center[1] - R[8] * cams[i].camera_center[2];
-		cams[i].translation[0]=t[0];
-		cams[i].translation[1]=t[1];
-		cams[i].translation[2]=t[2];
 
-		const double trace = R[0] + R[4] + R[8];
-		if(trace >=0.0){
-			double t = sqrt(trace + 1.0);
-			q[0] = 0.5 * t;
-			t = 0.5 / t;
-			q[1] = (R[7] - R[5]) * t;
-			q[2] = (R[2] - R[6]) * t;
-			q[3] = (R[3] - R[1]) * t;
-		}else{
-			int i = 0;
-			if(R[4]>R[0]){
-				i = 1;
-			}
-			if(R[8]>R[4*i]){
-				i = 2;
-			}
-			const int j = (i + 1) % 3;
-			const int k = (j + 1) % 3;
-			double t = sqrt(R[4 * i] - R[4 * j] - R[4 * k] + 1.0);
-			q[i + 1] = 0.5 * t;
-			t = 0.5 / t;
-			q[0] = (R[3 * k + j] - R[3 * j + k]) * t;
-			q[j + 1] = (R[3 * j + i] + R[3 * i + j]) * t;
-			q[k + 1] = (R[3 * k + i] + R[3 * i + k]) * t;
-		}
-		cams[i].quat[0] = q[0];
-		cams[i].quat[1] = q[1];
-		cams[i].quat[2] = q[2];
-		cams[i].quat[3] = q[3];
-		// printf("%f %f %f %f\n", q[0], q[1], q[2], q[3]);
-
-		const double sin_squared_theta = q[1]*q[1]+q[2]*q[2]+q[3]*q[3];
-		if(sin_squared_theta>0.0){
-			const double sin_theta = sqrt(sin_squared_theta);
-			const double &cos_theta = q[0];
-			const double two_theta = 2.0 * ((cos_theta < 0.0) ? atan2(-sin_theta, -cos_theta) : atan2(sin_theta, cos_theta));
-			const double k = two_theta / sin_theta;
-			axis_angle[0] = q[1] * k;
-			axis_angle[1] = q[2] * k;
-			axis_angle[2] = q[3] * k;
-		}else{
-			const double k = 2.0;
-			axis_angle[0] = q[1] * k;
-			axis_angle[1] = q[2] * k;
-			axis_angle[2] = q[3] * k;
-		}
-		cams[i].axis_angle[0] = axis_angle[0];
-		cams[i].axis_angle[1] = axis_angle[1];
-		cams[i].axis_angle[2] = axis_angle[2];
-
-		// 
-		// Eigen::Vector3d physical_t(cams[i].translation[0], cams[i].translation[1], cams[i].translation[2]);
-		// Eigen::Vector3d rv(cams[i].axis_angle[0], cams[i].axis_angle[1], cams[i].axis_angle[2]);
-		// double theta = rv.norm();
-		// Eigen::Matrix3d rv_hat;
-		// rv_hat << 0, -rv.z(), rv.y(),
-		// 		rv.z(), 0, -rv.x(),
-		// 		-rv.y(), rv.x(), 0;
-		// Eigen::Matrix3d J;
-		// if(theta<1e-6){
-		// 	J = Eigen::Matrix3d::Identity();
-		// }else{
-		// 	J = Eigen::Matrix3d::Identity() + (1 - cos(theta)) / (theta * theta) * rv_hat + (theta - sin(theta)) / (theta * theta * theta) * rv_hat * rv_hat;
-		// }
-		// Eigen::Vector3d rho = J.inverse() * physical_t;
-
-		// cams[i].se3[0] = rho[0];
-		// cams[i].se3[1] = rho[1];
-		// cams[i].se3[2] = rho[2];
-		cams[i].se3[0] = cams[i].quat[0];
-		cams[i].se3[1] = cams[i].quat[1];
-		cams[i].se3[2] = cams[i].quat[2];
-		cams[i].se3[3] = cams[i].quat[3];
-		cams[i].se3[4] = cams[i].translation[0];
-		cams[i].se3[5] = cams[i].translation[1];
-		cams[i].se3[6] = cams[i].translation[2];
-
-		// for (int j = 0; j < 6; ++j){
-		// 	printf("%f ", cams[i].se3[j]);
-		// }
-		// printf("\n");
-
-		// double data[6] = {
-		// 	rho[0], rho[1], rho[2],
-		// 	cams[i].axis_angle[0],   cams[i].axis_angle[1],   cams[i].axis_angle[2]
-		// };
-		// Eigen::Map<const Eigen::Matrix<double, 6, 1>> se3_vec(data);
-		// Sophus::SE3<double> T = Sophus::SE3<double>::exp(se3_vec);
-		// Eigen::Matrix<double, 6, 1> xi = T.log();
-		// for (int j = 0; j < 6; ++j){
-		// 	cams[i].se3[j] = xi[j];
-		// 	printf("%f ", cams[i].se3[j]);
-		// }
-		// printf("\n");
-		// printf("%f %f %f\n", T.translation()[0], T.translation()[1], T.translation()[2]);
-		// printf("%f %f %f\n", physical_t[0], physical_t[1], physical_t[2]);
-		// cams[i].se3[0] = cams[i].translation[0];
-		// cams[i].se3[1] = cams[i].translation[1];
-		// cams[i].se3[2] = cams[i].translation[2];
-	}
-	
-
-	if (m_bProvideXYZ)
+	if (m_bProvideXYZ) {
 		free(m_XYZ);
+		m_XYZ = nullptr;
+	}
 
 	fpXYZ = NULL;
+}
+
+void PBA::pba_applyAnchorPolicyAblation(double* feature_params)
+{
+	if (!m_bProvideXYZ || feature_params == nullptr || m_XYZ == nullptr ||
+		m_archor == nullptr || m_archorSort == nullptr || m_photo == nullptr ||
+		m_imgpts == nullptr || m_motstruct == nullptr || m_KR == nullptr) {
+		return;
+	}
+
+	const AnchorPolicy policy = anchor_policy_from_environment();
+	if (policy == AnchorPolicy::kCurrent) {
+		return;
+	}
+
+	struct Candidate {
+		int main_local = -1;
+		int assoc_local = -1;
+		int main_camera = -1;
+		int assoc_camera = -1;
+		double omega = 0.0;
+		double sin_omega = 0.0;
+		double baseline = 0.0;
+		double err_main = 0.0;
+		double err_assoc = 0.0;
+		double err_sum = 0.0;
+	};
+
+	auto camera_center = [this](int camera_id) -> const double* {
+		return m_motstruct + camera_id * 6 + 3;
+	};
+
+	auto projection_error = [this](int camera_id, const double ray[3],
+		int observation_id, double* error) -> bool {
+		const double* pKR = m_KR + camera_id * 9;
+		const double denom =
+			pKR[6] * ray[0] + pKR[7] * ray[1] + pKR[8] * ray[2];
+		if (std::abs(denom) < 1e-12) {
+			return false;
+		}
+		const double u =
+			(pKR[0] * ray[0] + pKR[1] * ray[1] + pKR[2] * ray[2]) / denom;
+		const double v =
+			(pKR[3] * ray[0] + pKR[4] * ray[1] + pKR[5] * ray[2]) / denom;
+		if (!std::isfinite(u) || !std::isfinite(v)) {
+			return false;
+		}
+		const double du = m_imgpts[observation_id * 2] - u;
+		const double dv = m_imgpts[observation_id * 2 + 1] - v;
+		*error = du * du + dv * dv;
+		return std::isfinite(*error);
+	};
+
+	auto apply_selected_pair = [this, feature_params, &camera_center](
+		int point_id, int nviews, const double* xyz, Candidate best,
+		bool apply_refinement) {
+		const double* center_main = camera_center(best.main_camera);
+		const double* center_assoc = camera_center(best.assoc_camera);
+		double ray_main[3] = {
+			xyz[0] - center_main[0],
+			xyz[1] - center_main[1],
+			xyz[2] - center_main[2]
+		};
+		double ray_assoc[3] = {
+			xyz[0] - center_assoc[0],
+			xyz[1] - center_assoc[1],
+			xyz[2] - center_assoc[2]
+		};
+		const double main_dist2 =
+			ray_main[0] * ray_main[0] +
+			ray_main[1] * ray_main[1] +
+			ray_main[2] * ray_main[2];
+		const double assoc_dist2 =
+			ray_assoc[0] * ray_assoc[0] +
+			ray_assoc[1] * ray_assoc[1] +
+			ray_assoc[2] * ray_assoc[2];
+
+		if (apply_refinement &&
+			((main_dist2 > 900.0 * assoc_dist2) ||
+			(best.err_main > best.err_assoc && nviews == 2))) {
+			std::swap(best.main_local, best.assoc_local);
+			std::swap(best.main_camera, best.assoc_camera);
+			std::swap(best.err_main, best.err_assoc);
+			std::swap(ray_main[0], ray_assoc[0]);
+			std::swap(ray_main[1], ray_assoc[1]);
+			std::swap(ray_main[2], ray_assoc[2]);
+		}
+
+		m_archor[point_id * 3 + 1] = best.main_camera;
+		m_archor[point_id * 3 + 2] = best.assoc_camera;
+		m_archorSort[point_id * 2] = best.main_local;
+		m_archorSort[point_id * 2 + 1] = best.assoc_local;
+		feature_params[point_id * 3] = std::atan2(ray_main[0], ray_main[2]);
+		feature_params[point_id * 3 + 1] =
+			std::atan2(ray_main[1], std::sqrt(ray_main[0] * ray_main[0] + ray_main[2] * ray_main[2]));
+		feature_params[point_id * 3 + 2] = best.omega;
+	};
+
+	int observation_start = 0;
+	for (int point_id = 0; point_id < m_n3Dpts; ++point_id) {
+		const int nviews = m_archor[point_id * 3];
+		if (nviews < 2) {
+			observation_start += std::max(0, nviews);
+			continue;
+		}
+
+		const double* xyz = m_XYZ + point_id * 3;
+		if (policy == AnchorPolicy::kCurrentPairPaperOrder ||
+			policy == AnchorPolicy::kCurrentPairPaperOrderRefine) {
+			int main_local = m_archorSort[point_id * 2];
+			int assoc_local = m_archorSort[point_id * 2 + 1];
+			if (main_local < 0 || assoc_local < 0 ||
+				main_local >= nviews || assoc_local >= nviews ||
+				main_local == assoc_local) {
+				observation_start += nviews;
+				continue;
+			}
+			if (main_local > assoc_local) {
+				std::swap(main_local, assoc_local);
+			}
+
+			const int main_camera = m_photo[observation_start + main_local];
+			const int assoc_camera = m_photo[observation_start + assoc_local];
+			if (main_camera < 0 || main_camera >= m_ncams ||
+				assoc_camera < 0 || assoc_camera >= m_ncams ||
+				main_camera == assoc_camera) {
+				observation_start += nviews;
+				continue;
+			}
+
+			const double* center_main = camera_center(main_camera);
+			const double* center_assoc = camera_center(assoc_camera);
+			double ray_main[3] = {
+				xyz[0] - center_main[0],
+				xyz[1] - center_main[1],
+				xyz[2] - center_main[2]
+			};
+			double ray_assoc[3] = {
+				xyz[0] - center_assoc[0],
+				xyz[1] - center_assoc[1],
+				xyz[2] - center_assoc[2]
+			};
+			const double main_norm2 =
+				ray_main[0] * ray_main[0] +
+				ray_main[1] * ray_main[1] +
+				ray_main[2] * ray_main[2];
+			const double assoc_norm2 =
+				ray_assoc[0] * ray_assoc[0] +
+				ray_assoc[1] * ray_assoc[1] +
+				ray_assoc[2] * ray_assoc[2];
+			if (main_norm2 <= 1e-24 || assoc_norm2 <= 1e-24) {
+				observation_start += nviews;
+				continue;
+			}
+
+			double err_main = std::numeric_limits<double>::infinity();
+			double err_assoc = std::numeric_limits<double>::infinity();
+			projection_error(
+				main_camera, ray_main, observation_start + main_local, &err_main);
+			projection_error(
+				assoc_camera, ray_assoc, observation_start + assoc_local, &err_assoc);
+			const double dot =
+				ray_main[0] * ray_assoc[0] +
+				ray_main[1] * ray_assoc[1] +
+				ray_main[2] * ray_assoc[2];
+			Candidate best;
+			best.main_local = main_local;
+			best.assoc_local = assoc_local;
+			best.main_camera = main_camera;
+			best.assoc_camera = assoc_camera;
+			best.omega = std::acos(
+				clamp_acos_arg(dot / std::sqrt(main_norm2 * assoc_norm2)));
+			best.sin_omega = std::sin(best.omega);
+			best.err_main = err_main;
+			best.err_assoc = err_assoc;
+			best.err_sum = err_main + err_assoc;
+			apply_selected_pair(
+				point_id, nviews, xyz, best,
+				policy == AnchorPolicy::kCurrentPairPaperOrderRefine);
+			observation_start += nviews;
+			continue;
+		}
+
+		std::vector<Candidate> candidates;
+		candidates.reserve((nviews * (nviews - 1)) / 2);
+		double min_err_sum = std::numeric_limits<double>::infinity();
+
+		for (int a = 0; a < nviews; ++a) {
+			const int camera_a = m_photo[observation_start + a];
+			if (camera_a < 0 || camera_a >= m_ncams) {
+				continue;
+			}
+			const double* center_a = camera_center(camera_a);
+			double ray_a[3] = {
+				xyz[0] - center_a[0],
+				xyz[1] - center_a[1],
+				xyz[2] - center_a[2]
+			};
+			const double ray_a_norm2 =
+				ray_a[0] * ray_a[0] + ray_a[1] * ray_a[1] + ray_a[2] * ray_a[2];
+			if (ray_a_norm2 <= 1e-24) {
+				continue;
+			}
+
+			for (int b = a + 1; b < nviews; ++b) {
+				const int camera_b = m_photo[observation_start + b];
+				if (camera_b < 0 || camera_b >= m_ncams || camera_b == camera_a) {
+					continue;
+				}
+				const double* center_b = camera_center(camera_b);
+				double ray_b[3] = {
+					xyz[0] - center_b[0],
+					xyz[1] - center_b[1],
+					xyz[2] - center_b[2]
+				};
+				const double ray_b_norm2 =
+					ray_b[0] * ray_b[0] + ray_b[1] * ray_b[1] + ray_b[2] * ray_b[2];
+				if (ray_b_norm2 <= 1e-24) {
+					continue;
+				}
+
+				double err_a = 0.0;
+				double err_b = 0.0;
+				if (!projection_error(camera_a, ray_a, observation_start + a, &err_a) ||
+					!projection_error(camera_b, ray_b, observation_start + b, &err_b)) {
+					continue;
+				}
+
+				const double dot =
+					ray_a[0] * ray_b[0] + ray_a[1] * ray_b[1] + ray_a[2] * ray_b[2];
+				const double omega = std::acos(
+					clamp_acos_arg(dot / std::sqrt(ray_a_norm2 * ray_b_norm2)));
+				if (!std::isfinite(omega)) {
+					continue;
+				}
+
+				const double baseline_x = center_b[0] - center_a[0];
+				const double baseline_y = center_b[1] - center_a[1];
+				const double baseline_z = center_b[2] - center_a[2];
+				Candidate candidate;
+				candidate.main_local = a;
+				candidate.assoc_local = b;
+				candidate.main_camera = camera_a;
+				candidate.assoc_camera = camera_b;
+				candidate.omega = omega;
+				candidate.sin_omega = std::sin(omega);
+				candidate.baseline = std::sqrt(
+					baseline_x * baseline_x +
+					baseline_y * baseline_y +
+					baseline_z * baseline_z);
+				candidate.err_main = err_a;
+				candidate.err_assoc = err_b;
+				candidate.err_sum = err_a + err_b;
+				min_err_sum = std::min(min_err_sum, candidate.err_sum);
+				candidates.push_back(candidate);
+			}
+		}
+
+		if (candidates.empty()) {
+			observation_start += nviews;
+			continue;
+		}
+
+		const double reproj_gate = std::max(
+			min_err_sum * 4.0,
+			min_err_sum + 100.0);
+		int best_index = -1;
+		double best_score = -std::numeric_limits<double>::infinity();
+		for (int candidate_id = 0; candidate_id < static_cast<int>(candidates.size());
+			++candidate_id) {
+			const Candidate& candidate = candidates[candidate_id];
+			double score = -std::numeric_limits<double>::infinity();
+			if (policy == AnchorPolicy::kTrueMaxParallax) {
+				score = candidate.omega;
+			} else if (policy == AnchorPolicy::kMaxParallaxReproj) {
+				if (candidate.err_sum > reproj_gate) {
+					continue;
+				}
+				score = candidate.omega;
+			} else if (policy == AnchorPolicy::kScoreReproj) {
+				score = candidate.sin_omega /
+					(1.0 + std::sqrt(candidate.err_main) + std::sqrt(candidate.err_assoc));
+			} else if (policy == AnchorPolicy::kScoreBaselineReproj) {
+				score = candidate.sin_omega * candidate.baseline /
+					(1.0 + std::sqrt(candidate.err_main) + std::sqrt(candidate.err_assoc));
+			}
+
+			if (best_index < 0 ||
+				score > best_score + 1e-15 ||
+				(std::abs(score - best_score) <= 1e-15 &&
+					candidate.err_sum < candidates[best_index].err_sum)) {
+				best_index = candidate_id;
+				best_score = score;
+			}
+		}
+
+		if (best_index < 0) {
+			observation_start += nviews;
+			continue;
+		}
+
+		Candidate best = candidates[best_index];
+		const double* center_main = camera_center(best.main_camera);
+		const double* center_assoc = camera_center(best.assoc_camera);
+		double ray_main[3] = {
+			xyz[0] - center_main[0],
+			xyz[1] - center_main[1],
+			xyz[2] - center_main[2]
+		};
+		double ray_assoc[3] = {
+			xyz[0] - center_assoc[0],
+			xyz[1] - center_assoc[1],
+			xyz[2] - center_assoc[2]
+		};
+		const double main_dist2 =
+			ray_main[0] * ray_main[0] +
+			ray_main[1] * ray_main[1] +
+			ray_main[2] * ray_main[2];
+		const double assoc_dist2 =
+			ray_assoc[0] * ray_assoc[0] +
+			ray_assoc[1] * ray_assoc[1] +
+			ray_assoc[2] * ray_assoc[2];
+
+		if ((main_dist2 > 900.0 * assoc_dist2) ||
+			(best.err_main > best.err_assoc && nviews == 2)) {
+			std::swap(best.main_local, best.assoc_local);
+			std::swap(best.main_camera, best.assoc_camera);
+			std::swap(best.err_main, best.err_assoc);
+			std::swap(center_main, center_assoc);
+			std::swap(ray_main[0], ray_assoc[0]);
+			std::swap(ray_main[1], ray_assoc[1]);
+			std::swap(ray_main[2], ray_assoc[2]);
+		}
+
+		m_archor[point_id * 3 + 1] = best.main_camera;
+		m_archor[point_id * 3 + 2] = best.assoc_camera;
+		m_archorSort[point_id * 2] = best.main_local;
+		m_archorSort[point_id * 2 + 1] = best.assoc_local;
+		feature_params[point_id * 3] = std::atan2(ray_main[0], ray_main[2]);
+		feature_params[point_id * 3 + 1] =
+			std::atan2(ray_main[1], std::sqrt(ray_main[0] * ray_main[0] + ray_main[2] * ray_main[2]));
+		feature_params[point_id * 3 + 2] = best.omega;
+
+		observation_start += nviews;
+	}
 }
 
 
@@ -2208,8 +2833,7 @@ bool PBA::pba_initializeAssoArchor(
 	double* feature,
 	int nMI,
 	int nAI,
-	int FID,
-	bool bLast )
+	int FID )
 {
 	int nM = photo[nMI];                           
 	int nA = photo[nAI];                         
@@ -2267,7 +2891,7 @@ bool PBA::pba_initializeAssoArchor(
 		feature[2] = PI;
 	else
 	{
-		double dw = acos( dDot/(dDisM*dDisA) );
+		double dw = acos(clamp_acos_arg(dDot / (dDisM * dDisA)));
 		feature[2] = dw;
 	}
 
@@ -2280,13 +2904,8 @@ bool PBA::pba_initializeAssoArchor(
 	double dDot1 = xM[0]*pti2k[0] + xM[1]*pti2k[1] + xM[2]*pti2k[2];
 	double dDisi2k = sqrt( pti2k[0]*pti2k[0] + pti2k[1]*pti2k[1] + pti2k[2]*pti2k[2] );
 	double tmp = dDot1/(dDisM*dDisi2k);
-	double dW2;
-	if (tmp > 1)						
-		dW2 = 0;
-	if ( tmp < -1)						
-		dW2 = PI;
-	else
-		dW2  = acos( tmp );
+	tmp = clamp_acos_arg(tmp);
+	double dW2 = acos(tmp);
 
 	return true;
 }
@@ -2302,7 +2921,6 @@ bool PBA::pba_initializeOtheArchors(
 	int nOI,
 	int FID )
 {
-	static int i = 0;
 	double dw = feature[2];                   
 	double dwNew;
 	double dmaxw = dw;
@@ -2340,7 +2958,7 @@ bool PBA::pba_initializeOtheArchors(
 		double dDAngle = atan2( xO(0), xO(2) );
 		double dHAngle = atan2( xO(1), sqrt(xO(0)*xO(0)+ xO(2)*xO(2)) );
 
-		for ( i = 0; i < nfeacout; i++ )
+		for (int i = 0; i < nfeacout; i++ )
 		{
 			//Main Archor Vector
 			int nM = photo[i];                            
@@ -2377,7 +2995,7 @@ bool PBA::pba_initializeOtheArchors(
 			else if(dDot/(dDisM*dDisA)<-1)
 				dwNew = PI;
 			else
-				dwNew = acos( dDot/(dDisM*dDisA) );
+				dwNew = acos(clamp_acos_arg(dDot / (dDisM * dDisA)));
 
 			if ( dwNew > dmaxw )
 			{
@@ -2393,6 +3011,3 @@ bool PBA::pba_initializeOtheArchors(
 	}
 	return bAdjust;
 }
-
-
-

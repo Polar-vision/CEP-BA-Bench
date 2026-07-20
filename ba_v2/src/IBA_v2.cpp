@@ -2,7 +2,6 @@
 #include "IBA_v2.h"
 #include <stdio.h>
 
-//�����ļ��з�ע���е�����
 int IBA::findNcameras(FILE* fp)
 {
 	int lineno, ncams, ch;
@@ -236,15 +235,14 @@ int IBA::readNInts(FILE* fp, int* vals, int nvals)
 	int i;
 	int n, j;
 
-	for (i = n = 0; i < nvals; ++i) {//��һ�Σ�nvals����1
-		j = fscanf_s(fp, "%d", vals + i);//��һ�Σ���ȡ��һ����Ҳ����1����ά�������2DͶӰ����
-		if (j == EOF) return EOF;//��һ�Σ�һ�㲻���ǣ�����j=1����ʾ�ɹ�
+	for (i = n = 0; i < nvals; ++i) {
+		j = fscanf_s(fp, "%d", vals + i);
+		if (j == EOF) return EOF;
 
-		if (j != 1 || ferror(fp)) return EOF - 1;//��һ�Σ�һ�㶼�ǣ�j=1����ʾ�ɹ�
+		if (j != 1 || ferror(fp)) return EOF - 1;
 
-		n += j;//��һ����Ϊn=0�����Ծ���j��Ҳ���ǳɹ���־j=1
-	}//֮��Ļ���fscanfÿ��һ����ô�ͻ��ƶ�ָ�룬Ȼ��%d��������ո񡢻��з��������հ��ַ���ֱ��������%d����������
-	//����������EOF����j!=0��
+		n += j;
+	}
 	return n;
 }
 
@@ -253,17 +251,17 @@ int IBA::readNDoubles(FILE* fp, double* vals, int nvals)
 	int i;
 	int n, j;
 
-	for (i = n = 0; i < nvals; ++i)//nvals��2����ȡxy����
+	for (i = n = 0; i < nvals; ++i)
 	{
-		j = fscanf_s(fp, "%lf", vals + i);//���￪ʼ������float��Ҳ��������ֵ
+		j = fscanf_s(fp, "%lf", vals + i);
 		if (j == EOF) return EOF;
 
 		if (j != 1 || ferror(fp)) return EOF - 1;
 
-		n += j;//����֮���2��Ϊ����2��
+		n += j;
 	}
 
-	return n;//����2
+	return n;
 }
 
 void IBA::ba_readCameraPoseration(char* fname, double* ical)
@@ -303,12 +301,93 @@ void IBA::ba_readCameraPoseration(char* fname, double* ical)
 
 void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double* K, double* p)
 {
+	if (KdA == nullptr || KdB == nullptr || KdG == nullptr)
+	{
+		if (!m_bFocal)
+		{
+			for (int i = 0; i < m_ncams; i++)
+			{
+				const double* ptAngle = p + i * 6;
+				double* pKR = KR + i * 9;
+				const double* pK = K + (m_V[i] - 1) * 9;
+
+				const double ey = ptAngle[0];
+				const double ex = ptAngle[1];
+				const double ez = ptAngle[2];
+				const double c1 = cos(ey);
+				const double c2 = cos(ex);
+				const double c3 = cos(ez);
+				const double s1 = sin(ey);
+				const double s2 = sin(ex);
+				const double s3 = sin(ez);
+
+				double matR[9];
+				matR[0] = c1*c3-s1*s2*s3;     matR[1] = c2*s3;     matR[2] = s1*c3+c1*s2*s3;
+				matR[3] = -c1*s3-s1*s2*c3;    matR[4] = c2*c3;     matR[5] = -s1*s3+c1*s2*c3;
+				matR[6] = -s1*c2;             matR[7] = -s2;       matR[8] = c1*c2;
+
+				pKR[0] = pK[0] * matR[0] + pK[3] * matR[3] + pK[6] * matR[6];
+				pKR[1] = pK[0] * matR[1] + pK[3] * matR[4] + pK[6] * matR[7];
+				pKR[2] = pK[0] * matR[2] + pK[3] * matR[5] + pK[6] * matR[8];
+				pKR[3] = pK[1] * matR[0] + pK[4] * matR[3] + pK[7] * matR[6];
+				pKR[4] = pK[1] * matR[1] + pK[4] * matR[4] + pK[7] * matR[7];
+				pKR[5] = pK[1] * matR[2] + pK[4] * matR[5] + pK[7] * matR[8];
+				pKR[6] = pK[2] * matR[0] + pK[5] * matR[3] + pK[8] * matR[6];
+				pKR[7] = pK[2] * matR[1] + pK[5] * matR[4] + pK[8] * matR[7];
+				pKR[8] = pK[2] * matR[2] + pK[5] * matR[5] + pK[8] * matR[8];
+			}
+		}
+		else
+		{
+			double localK[9];
+			memset(localK, 0, 9 * sizeof(double));
+			localK[8] = 1;
+			for (int i = 0; i < m_ncams; i++)
+			{
+				const double* ptAngle = p + i * 6;
+				double* pKR = KR + i * 9;
+
+				const double c0 = cos(ptAngle[0]);
+				const double s0 = sin(ptAngle[0]);
+				const double c1 = cos(ptAngle[1]);
+				const double s1 = sin(ptAngle[1]);
+				const double c2 = cos(ptAngle[2]);
+				const double s2 = sin(ptAngle[2]);
+
+				double matR[9];
+				matR[0] = c1 * c0;
+				matR[1] = c1 * s0;
+				matR[2] = -s1;
+				matR[3] = s2 * s1 * c0 - c2 * s0;
+				matR[4] = s2 * s1 * s0 + c2 * c0;
+				matR[5] = s2 * c1;
+				matR[6] = c2 * s1 * c0 + s2 * s0;
+				matR[7] = c2 * s1 * s0 - s2 * c0;
+				matR[8] = c2 * c1;
+
+				localK[0] = m_K[i * 3];
+				localK[4] = m_K[i * 3];
+
+				pKR[0] = localK[0] * matR[0] + localK[3] * matR[3] + localK[6] * matR[6];
+				pKR[1] = localK[0] * matR[1] + localK[3] * matR[4] + localK[6] * matR[7];
+				pKR[2] = localK[0] * matR[2] + localK[3] * matR[5] + localK[6] * matR[8];
+				pKR[3] = localK[1] * matR[0] + localK[4] * matR[3] + localK[7] * matR[6];
+				pKR[4] = localK[1] * matR[1] + localK[4] * matR[4] + localK[7] * matR[7];
+				pKR[5] = localK[1] * matR[2] + localK[4] * matR[5] + localK[7] * matR[8];
+				pKR[6] = localK[2] * matR[0] + localK[5] * matR[3] + localK[8] * matR[6];
+				pKR[7] = localK[2] * matR[1] + localK[5] * matR[4] + localK[8] * matR[7];
+				pKR[8] = localK[2] * matR[2] + localK[5] * matR[5] + localK[8] * matR[8];
+			}
+		}
+		return;
+	}
+
 	if (!m_bFocal)
 	{
 		int i = 0;
 		double* ptAngle;
 		double* pKR, * pKdA, * pKdB, * pKdG, * pK;
-		double matR[9];//�����ת����
+		double matR[9];
 		double matRG[9], matRB[9], matRA[9];
 		double matDRG[9], matDRB[9], matDRA[9];
 		double tmp1[9], tmp2[9];
@@ -317,8 +396,8 @@ void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double*
 		//}
 		for (i = 0; i < m_ncams; i++)
 		{
-			ptAngle = p + i * 6;//ָ�������ξ���
-			/*phi omega kappaϵͳ*/
+			ptAngle = p + i * 6;
+			/*phi omega kappa系统*/
 			//matR=matRG*matRB*matRA
 			//ptAngle=[kappa,phi,omega]
 			double ey = ptAngle[0];
@@ -339,39 +418,33 @@ void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double*
 			// matR[7] = cos(ptAngle[2]) * sin(ptAngle[1]) * sin(ptAngle[0]) - sin(ptAngle[2]) * cos(ptAngle[0]);
 			// matR[8] = cos(ptAngle[2]) * cos(ptAngle[1]);
 
-			//omega��ת����
 			matRG[0] = 1;		matRG[1] = 0;				matRG[2] = 0;
 			matRG[3] = 0;		matRG[4] = cos(ptAngle[2]);	matRG[5] = sin(ptAngle[2]);
 			matRG[6] = 0;		matRG[7] = -sin(ptAngle[2]);	matRG[8] = cos(ptAngle[2]);
 
-			//phi��ת����
 			matRB[0] = cos(ptAngle[1]);		matRB[1] = 0;		matRB[2] = -sin(ptAngle[1]);
 			matRB[3] = 0;					matRB[4] = 1;		matRB[5] = 0;
 			matRB[6] = sin(ptAngle[1]);		matRB[7] = 0;		matRB[8] = cos(ptAngle[1]);
 
-			//kappa��ת����
 			matRA[0] = cos(ptAngle[0]);		matRA[1] = sin(ptAngle[0]);			matRA[2] = 0;
 			matRA[3] = -sin(ptAngle[0]);	matRA[4] = cos(ptAngle[0]);			matRA[5] = 0;
 			matRA[6] = 0;					matRA[7] = 0;						matRA[8] = 1;
 
-			//matRG�������omega��һ�׵�
 			matDRG[0] = 0;		matDRG[1] = 0;			matDRG[2] = 0;
 			matDRG[3] = 0;		matDRG[4] = -sin(ptAngle[2]);	matDRG[5] = cos(ptAngle[2]);
 			matDRG[6] = 0;		matDRG[7] = -cos(ptAngle[2]);	matDRG[8] = -sin(ptAngle[2]);
 
-			//matRB�������phi��һ�׵�
 			matDRB[0] = -sin(ptAngle[1]);		matDRB[1] = 0;		matDRB[2] = -cos(ptAngle[1]);
 			matDRB[3] = 0;						matDRB[4] = 0;		matDRB[5] = 0;
 			matDRB[6] = cos(ptAngle[1]);		matDRB[7] = 0;		matDRB[8] = -sin(ptAngle[1]);
 
-			//matRA�������kappa��һ�׵�
 			matDRA[0] = -sin(ptAngle[0]);		matDRA[1] = cos(ptAngle[0]);		matDRA[2] = 0;
 			matDRA[3] = -cos(ptAngle[0]);		matDRA[4] = -sin(ptAngle[0]);		matDRA[5] = 0;
 			matDRA[6] = 0;						matDRA[7] = 0;						matDRA[8] = 0;
 
 			//pKR=KR*matR
 			pKR = KR + i * 9;
-			pK = K + (m_V[i] - 1) * 9;//���ڷ�BAL����
+			pK = K + (m_V[i] - 1) * 9;
 			//printf("%d\n", m_V[i]);
 			//printf("%f %f %f\n", pK[0], pK[3], pK[6]);
 			//printf("%f %f %f\n", pK[1], pK[4], pK[7]);
@@ -386,7 +459,6 @@ void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double*
 			pKR[7] = pK[2] * matR[1] + pK[5] * matR[4] + pK[8] * matR[7];
 			pKR[8] = pK[2] * matR[2] + pK[5] * matR[5] + pK[8] * matR[8];
 
-			//pKR�������omega��һ�׵�
 			pKdG = KdG + i * 9;
 			tmp1[0] = pK[0] * matDRG[0] + pK[3] * matDRG[3] + pK[6] * matDRG[6];
 			tmp1[1] = pK[1] * matDRG[0] + pK[4] * matDRG[3] + pK[7] * matDRG[6];
@@ -418,7 +490,6 @@ void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double*
 			pKdG[5] = tmp2[1] * matRA[2] + tmp2[4] * matRA[5] + tmp2[7] * matRA[8];
 			pKdG[8] = tmp2[2] * matRA[2] + tmp2[5] * matRA[5] + tmp2[8] * matRA[8];
 
-			//pKR�������phi��һ�׵�
 			pKdB = KdB + i * 9;
 			tmp1[0] = pK[0] * matRG[0] + pK[3] * matRG[3] + pK[6] * matRG[6];
 			tmp1[1] = pK[1] * matRG[0] + pK[4] * matRG[3] + pK[7] * matRG[6];
@@ -450,7 +521,6 @@ void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double*
 			pKdB[5] = tmp2[1] * matRA[2] + tmp2[4] * matRA[5] + tmp2[7] * matRA[8];
 			pKdB[8] = tmp2[2] * matRA[2] + tmp2[5] * matRA[5] + tmp2[8] * matRA[8];
 
-			//pKR�������kappa��һ�׵�
 			pKdA = KdA + i * 9;
 			tmp2[0] = tmp1[0] * matRB[0] + tmp1[3] * matRB[3] + tmp1[6] * matRB[6];
 			tmp2[1] = tmp1[1] * matRB[0] + tmp1[4] * matRB[3] + tmp1[7] * matRB[6];
@@ -500,27 +570,21 @@ void IBA::ba_updateKR(double* KR, double* KdA, double* KdB, double* KdG, double*
 			matR[7] = cos(ptAngle[2]) * sin(ptAngle[1]) * sin(ptAngle[0]) - sin(ptAngle[2]) * cos(ptAngle[0]);
 			matR[8] = cos(ptAngle[2]) * cos(ptAngle[1]);
 
-			//����omega����ת����
 			matRG[0] = 1;		matRG[1] = 0;				matRG[2] = 0;
 			matRG[3] = 0;		matRG[4] = cos(ptAngle[2]);	matRG[5] = sin(ptAngle[2]);
 			matRG[6] = 0;		matRG[7] = -sin(ptAngle[2]);	matRG[8] = cos(ptAngle[2]);
-			//����phi����ת����
 			matRB[0] = cos(ptAngle[1]);		matRB[1] = 0;		matRB[2] = -sin(ptAngle[1]);
 			matRB[3] = 0;					matRB[4] = 1;		matRB[5] = 0;
 			matRB[6] = sin(ptAngle[1]);		matRB[7] = 0;		matRB[8] = cos(ptAngle[1]);
-			//����kappa����ת����
 			matRA[0] = cos(ptAngle[0]);		matRA[1] = sin(ptAngle[0]);			matRA[2] = 0;
 			matRA[3] = -sin(ptAngle[0]);	matRA[4] = cos(ptAngle[0]);			matRA[5] = 0;
 			matRA[6] = 0;					matRA[7] = 0;						matRA[8] = 1;
-			//��omega��һ�׵�
 			matDRG[0] = 0;		matDRG[1] = 0;			matDRG[2] = 0;
 			matDRG[3] = 0;		matDRG[4] = -sin(ptAngle[2]);	matDRG[5] = cos(ptAngle[2]);
 			matDRG[6] = 0;		matDRG[7] = -cos(ptAngle[2]);	matDRG[8] = -sin(ptAngle[2]);
-			//��phi��һ�׵�
 			matDRB[0] = -sin(ptAngle[1]);		matDRB[1] = 0;		matDRB[2] = -cos(ptAngle[1]);
 			matDRB[3] = 0;						matDRB[4] = 0;		matDRB[5] = 0;
 			matDRB[6] = cos(ptAngle[1]);		matDRB[7] = 0;		matDRB[8] = -sin(ptAngle[1]);
-			//��kappa��һ�׵�
 			matDRA[0] = -sin(ptAngle[0]);		matDRA[1] = cos(ptAngle[0]);		matDRA[2] = 0;
 			matDRA[3] = -cos(ptAngle[0]);		matDRA[4] = -sin(ptAngle[0]);		matDRA[5] = 0;
 			matDRA[6] = 0;						matDRA[7] = 0;						matDRA[8] = 0;
