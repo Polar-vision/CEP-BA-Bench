@@ -26,6 +26,8 @@ struct DatasetPaths {
     fs::path feature;
     fs::path xyz;
     fs::path calib;
+    fs::path gcp;
+    fs::path gcp_observations;
 };
 
 struct InputFiles {
@@ -33,6 +35,8 @@ struct InputFiles {
     fs::path feature;
     fs::path xyz;
     fs::path calib;
+    fs::path gcp;
+    fs::path gcp_observations;
 };
 
 const char* summary_header() {
@@ -45,7 +49,24 @@ const char* summary_header() {
            "iterations_to_gradient_tolerance,final_relative_function_decrease,"
            "final_relative_step_size,final_lm_gain_ratio,"
            "final_gradient_lipschitz_estimate,final_direction_quality,"
-           "termination_type,report";
+           "termination_type,termination_type_name,termination_message,"
+           "num_threads,report";
+}
+
+std::string csv_field(const std::string& value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) {
+        return value;
+    }
+    std::string escaped = "\"";
+    for (const char character : value) {
+        if (character == '"') {
+            escaped += "\"\"";
+        } else {
+            escaped += character;
+        }
+    }
+    escaped += '"';
+    return escaped;
 }
 
 std::string run_key(const std::string& base_dataset,
@@ -110,6 +131,11 @@ bool output_mode_from_name(const std::string& name, BenchmarkOutputMode* mode) {
         *mode = BenchmarkOutputMode::Diagnostic;
         return true;
     }
+    if (value == "clean-logged" || value == "logged-clean" ||
+        value == "clean-log" || value == "logged") {
+        *mode = BenchmarkOutputMode::CleanLogged;
+        return true;
+    }
     return false;
 }
 
@@ -117,10 +143,12 @@ void print_usage(const char* exe) {
     std::cout
         << "Usage: " << exe << " [--problems <input-root>] [--out <results>]\n"
         << "                  [--method <MethodId>] [--limit <N>] [--dataset <name>]\n"
-        << "                  [--mode clean|diagnostic] [--resume]\n"
+        << "                  [--mode clean|clean-logged|diagnostic] [--resume]\n"
         << "                  [--no-xyz]\n"
         << "                  [--point-condition-sample <N>]\n"
         << "                  [--schur-sample <N>]\n"
+        << "                  [--use-gcp-control]\n"
+        << "                  [--gcp <gcp.txt>] [--gcp-observations <gcp_observations.txt>]\n"
         << "\n"
         << "Input root may be a BA Datasets tree with Initial Value/Ground Truth\n"
         << "folders, or a prepared original/quality benchmark tree.\n"
@@ -129,8 +157,11 @@ void print_usage(const char* exe) {
         << "            A1-SphInvRange-Ac, A2-Parallax-Mc,\n"
         << "            A1-XYZ-Aw, A1-XYInvZ-Aw, A1-SphRange-Aw,\n"
         << "            A1-SphInvRange-Aw, A2-Parallax-Mw\n"
-        << "Modes: clean writes only summary.csv; diagnostic also writes report,\n"
-        << "       metrics.json, convergence.txt, FinalPose.txt, and Final3D.ply.\n"
+        << "Modes: clean writes only summary.csv; clean-logged writes lightweight\n"
+        << "       per-run convergence.csv and termination logs; diagnostic also\n"
+        << "       writes strict diagnostics, report, metrics, and final files.\n"
+        << "--use-gcp-control adds fixed 3D GCP projection residuals from non-checkpoints;\n"
+        << "       checkpoints are held out and never added to the optimization.\n"
         << "--resume retains successful rows, reruns failures, and skips completed runs.\n";
 }
 
@@ -159,11 +190,13 @@ std::optional<InputFiles> find_input_files(const fs::path& dataset_root) {
     const fs::path feature = dataset_root / "Feature.txt";
     const fs::path xyz = dataset_root / "XYZ.txt";
     const fs::path calib = dataset_root / "cal.txt";
+    const fs::path gcp = dataset_root / "gcp.txt";
+    const fs::path gcp_observations = dataset_root / "gcp_observations.txt";
     const auto cam = find_camera_file(dataset_root);
     if (!cam || !fs::exists(feature) || !fs::exists(xyz) || !fs::exists(calib)) {
         return std::nullopt;
     }
-    return InputFiles{*cam, feature, xyz, calib};
+    return InputFiles{*cam, feature, xyz, calib, gcp, gcp_observations};
 }
 
 std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
@@ -207,7 +240,9 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
                             files->cam,
                             files->feature,
                             files->xyz,
-                            files->calib});
+                            files->calib,
+                            files->gcp,
+                            files->gcp_observations});
     };
 
     auto maybe_add_initial_value_problem = [&](const fs::path& problem_root,
@@ -236,6 +271,17 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
         }
         const std::string first_name = first_entry.path().filename().string();
         maybe_add_initial_value_problem(first_entry.path(), "");
+
+        // A prepared benchmark has <base>/quality/<run-name>, where the
+        // run-name can be "Initial Value". Do not reinterpret that folder
+        // as the native <category>/<problem>/Initial Value layout.
+        const bool is_prepared_base =
+            fs::is_directory(first_entry.path() / "original") &&
+            fs::is_directory(first_entry.path() / "quality");
+        if (is_prepared_base) {
+            continue;
+        }
+
         for (const auto& second_entry : fs::directory_iterator(first_entry.path())) {
             if (second_entry.is_directory()) {
                 maybe_add_initial_value_problem(second_entry.path(), first_name);
@@ -300,6 +346,9 @@ int main(int argc, char* argv[]) {
     std::size_t limit = 0;
     bool resume = false;
     bool use_xyz = true;
+    bool use_gcp_control = false;
+    fs::path gcp_override;
+    fs::path gcp_observations_override;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -332,10 +381,18 @@ int main(int argc, char* argv[]) {
             output_mode = BenchmarkOutputMode::Diagnostic;
         } else if (arg == "--clean-timing") {
             output_mode = BenchmarkOutputMode::CleanTiming;
+        } else if (arg == "--clean-logged") {
+            output_mode = BenchmarkOutputMode::CleanLogged;
         } else if (arg == "--resume") {
             resume = true;
         } else if (arg == "--no-xyz") {
             use_xyz = false;
+        } else if (arg == "--use-gcp-control") {
+            use_gcp_control = true;
+        } else if (arg == "--gcp" && i + 1 < argc) {
+            gcp_override = argv[++i];
+        } else if (arg == "--gcp-observations" && i + 1 < argc) {
+            gcp_observations_override = argv[++i];
         } else if (arg == "--point-condition-sample" && i + 1 < argc) {
             point_condition_sample = std::max(0, std::stoi(argv[++i]));
         } else if (arg == "--schur-sample" && i + 1 < argc) {
@@ -361,6 +418,11 @@ int main(int argc, char* argv[]) {
         std::ifstream existing_summary(summary_path);
         std::string line;
         std::getline(existing_summary, line);
+        if (line != summary_header()) {
+            std::cerr << "Cannot resume an incompatible summary schema: "
+                      << summary_path << "\n";
+            return 2;
+        }
         std::vector<std::string> fields;
         while (std::getline(existing_summary, line)) {
             if (!parse_summary_prefix(line, &fields) || fields[4] != "ok") {
@@ -404,7 +466,9 @@ int main(int argc, char* argv[]) {
         for (const MethodId method : selected_methods) {
             ++run_index;
             const std::string method_name = method_id_name(method);
-            const std::string mode_name = benchmark_output_mode_name(output_mode);
+            const std::string base_mode_name = benchmark_output_mode_name(output_mode);
+            const std::string mode_name =
+                use_gcp_control ? base_mode_name + "-gcp-control" : base_mode_name;
             const std::string key =
                 run_key(dataset.base_name, dataset.name, method_name, mode_name);
             if (resume && completed_runs.find(key) != completed_runs.end()) {
@@ -413,8 +477,11 @@ int main(int argc, char* argv[]) {
             }
             ++attempted_runs;
             const bool diagnostics = output_mode == BenchmarkOutputMode::Diagnostic;
-            const fs::path run_dir = output_root / dataset.base_name / dataset.name / method_name;
-            if (diagnostics) {
+            const bool writes_run_files = output_mode != BenchmarkOutputMode::CleanTiming;
+            const std::string run_leaf =
+                use_gcp_control ? method_name + "__gcp-control" : method_name;
+            const fs::path run_dir = output_root / dataset.base_name / dataset.name / run_leaf;
+            if (writes_run_files) {
                 fs::create_directories(run_dir);
             }
 
@@ -429,6 +496,14 @@ int main(int argc, char* argv[]) {
             const std::string report_s = report.string();
             const std::string pose_s = pose.string();
             const std::string points_s = points.string();
+            const fs::path gcp_path =
+                gcp_override.empty() ? dataset.gcp : gcp_override;
+            const fs::path gcp_observations_path =
+                gcp_observations_override.empty()
+                    ? dataset.gcp_observations
+                    : gcp_observations_override;
+            const std::string gcp_s = gcp_path.string();
+            const std::string gcp_observations_s = gcp_observations_path.string();
 
             std::cout << "\n[" << run_index << "/" << total_runs << "] "
                       << dataset.base_name << " / " << dataset.name << " / "
@@ -437,19 +512,31 @@ int main(int argc, char* argv[]) {
             bool ok = false;
             BARunMetrics metrics;
             try {
-                BAExporter ba;
-                ok = ba.ba_run(cam_s.c_str(),
-                               feature_s.c_str(),
-                               use_xyz ? xyz_s.c_str() : nullptr,
-                               calib_s.c_str(),
-                               diagnostics ? report_s.c_str() : nullptr,
-                               diagnostics ? pose_s.c_str() : nullptr,
-                               diagnostics ? points_s.c_str() : nullptr,
-                               method,
-                               output_mode,
-                               diagnostics ? point_condition_sample : 0,
-                               diagnostics ? schur_sample : 0);
-                metrics = ba.last_metrics();
+                if (use_gcp_control &&
+                    (!fs::is_regular_file(gcp_path) ||
+                     !fs::is_regular_file(gcp_observations_path))) {
+                    std::cerr << "Missing GCP control files for "
+                              << dataset.base_name << " / " << dataset.name
+                              << ": " << gcp_path << " and "
+                              << gcp_observations_path << "\n";
+                } else {
+                    BAExporter ba;
+                    ok = ba.ba_run(cam_s.c_str(),
+                                   feature_s.c_str(),
+                                   use_xyz ? xyz_s.c_str() : nullptr,
+                                   calib_s.c_str(),
+                                   writes_run_files ? report_s.c_str() : nullptr,
+                                   diagnostics ? pose_s.c_str() : nullptr,
+                                   diagnostics ? points_s.c_str() : nullptr,
+                                   method,
+                                   output_mode,
+                                   diagnostics ? point_condition_sample : 0,
+                                   diagnostics ? schur_sample : 0,
+                                   use_gcp_control ? gcp_s.c_str() : nullptr,
+                                   use_gcp_control ? gcp_observations_s.c_str() : nullptr,
+                                   use_gcp_control);
+                    metrics = ba.last_metrics();
+                }
             } catch (const std::exception& ex) {
                 std::cerr << "Run failed: " << ex.what() << "\n";
             }
@@ -488,7 +575,10 @@ int main(int argc, char* argv[]) {
                     << metrics.final_gradient_lipschitz_estimate << ','
                     << metrics.final_direction_quality << ','
                     << metrics.termination_type << ','
-                    << (diagnostics ? report.string() : "") << "\n";
+                    << csv_field(metrics.termination_type_name) << ','
+                    << csv_field(metrics.termination_message) << ','
+                    << metrics.num_threads << ','
+                    << csv_field(writes_run_files ? report.string() : "") << "\n";
             summary.flush();
             if (ok) {
                 completed_runs.insert(key);

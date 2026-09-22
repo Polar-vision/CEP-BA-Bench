@@ -8,6 +8,8 @@
     #define BAapi __declspec(dllimport)
 #endif
 
+#include <string>
+
 enum ObjectPointType {
     xyz = 0,
     xy_inverse_z = 1,
@@ -50,6 +52,7 @@ enum class MethodId {
 enum class BenchmarkOutputMode {
     CleanTiming = 0,
     Diagnostic = 1,
+    CleanLogged = 2,
 };
 
 struct BARunMetrics {
@@ -79,6 +82,16 @@ struct BARunMetrics {
     double final_direction_quality = 0.0;
     double solver_time_sec = 0.0;
     double linear_solver_time_sec = 0.0;
+    int num_threads = 0;
+    int max_num_iterations = 0;
+    double function_tolerance = 0.0;
+    double gradient_tolerance = 0.0;
+    double parameter_tolerance = 0.0;
+    double min_relative_decrease = 0.0;
+    double initial_trust_region_radius = 0.0;
+    bool jacobi_scaling = false;
+    std::string termination_type_name;
+    std::string termination_message;
 };
 
 BAapi const char* method_id_name(MethodId method);
@@ -103,7 +116,10 @@ public:
                 MethodId method = MethodId::A0_XYZ,
                 BenchmarkOutputMode output_mode = BenchmarkOutputMode::Diagnostic,
                 int point_condition_sample = 0,
-                int schur_sample = 0);
+                int schur_sample = 0,
+                const char* szGcp = nullptr,
+                const char* szGcpObservations = nullptr,
+                bool use_gcp_control = false);
 
     bool ba_initialize(const char* szCamera,
                        const char* szFeature,

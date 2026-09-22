@@ -137,6 +137,8 @@ const char* benchmark_output_mode_name(BenchmarkOutputMode mode) {
         return "clean";
     case BenchmarkOutputMode::Diagnostic:
         return "diagnostic";
+    case BenchmarkOutputMode::CleanLogged:
+        return "clean-logged";
     }
     return "diagnostic";
 }
@@ -159,7 +161,10 @@ bool BAExporter::ba_run(const char* szCam,
                         MethodId method,
                         BenchmarkOutputMode output_mode,
                         int point_condition_sample,
-                        int schur_sample) {
+                        int schur_sample,
+                        const char* szGcp,
+                        const char* szGcpObservations,
+                        bool use_gcp_control) {
     return ptr->ba_run(const_cast<char*>(szCam),
                        const_cast<char*>(szFea),
                        const_cast<char*>(szXYZ),
@@ -170,7 +175,10 @@ bool BAExporter::ba_run(const char* szCam,
                        method,
                        output_mode,
                        point_condition_sample,
-                       schur_sample);
+                       schur_sample,
+                       const_cast<char*>(szGcp),
+                       const_cast<char*>(szGcpObservations),
+                       use_gcp_control);
 }
 
 bool BAExporter::ba_initialize(const char* szCamera,

@@ -166,8 +166,10 @@ prepared layout:
 ```text
 example.exe [--problems <input-root>] [--out <results-root>]
             [--method <MethodId>] [--limit <N>] [--dataset <name>]
-            [--mode clean|diagnostic] [--resume] [--no-xyz]
+            [--mode clean|clean-logged|diagnostic] [--resume] [--no-xyz]
             [--point-condition-sample <N>] [--schur-sample <N>]
+            [--use-gcp-control]
+            [--gcp <gcp.txt>] [--gcp-observations <gcp_observations.txt>]
 ```
 
 Important options:
@@ -178,11 +180,15 @@ Important options:
 - `--limit`: limit the number of discovered benchmark problems
 - `--dataset`: run one category/problem/base name or run name
 - `--mode clean`: timing and summary-output mode
+- `--mode clean-logged`: clean solver run with lightweight per-iteration
+  convergence and termination logs
 - `--mode diagnostic`: export reports, convergence, poses, point clouds, and sampled diagnostics
 - `--resume`: keep successful rows in an existing `summary.csv`, rerun failures, and skip completed runs
 - `--no-xyz`: exclude `A0-XYZ-W`
 - `--point-condition-sample`: sample point-block conditioning diagnostics
 - `--schur-sample`: sample reduced camera Schur-system diagnostics
+- `--use-gcp-control`: add fixed 3D GCP projection residuals from non-checkpoint records; checkpoint records are held out
+- `--gcp`, `--gcp-observations`: override the per-run `gcp.txt` and `gcp_observations.txt` files used by `--use-gcp-control`
 
 ## Clean Run
 
@@ -209,7 +215,29 @@ Smoke test one problem and one method:
 
 The summary file records status, Ceres termination status, runtime,
 linear-solver time, iteration counts, reprojection RMSE, final gradient norms,
-and the diagnostic report path when applicable.
+termination message, actual thread count, and the report path when applicable.
+
+## Logged Clean Run
+
+The logged-clean mode preserves the clean solver configuration and does not
+enable strict vector diagnostics. It writes `convergence.csv`, `report.txt`,
+and `metrics.json` for each problem-method pair. The convergence file includes
+Ceres' per-iteration RMSE and `iteration_time_sec`,
+`step_solver_time_sec`, and `cumulative_time_sec` fields. The report preserves
+the raw Ceres termination message and full solver report, which can distinguish
+function, gradient, and parameter tolerance termination.
+
+```powershell
+.\example_v2\build\Release\example.exe `
+  --problems "E:\zuo\projects\CEP\BA Datasets" `
+  --out E:\zuo\projects\CEP\benchmark_initial_value_clean_logged `
+  --mode clean-logged `
+  --resume
+```
+
+Use a new output root when changing the summary schema. The logged-clean
+`solver_time_sec` and per-iteration `cumulative_time_sec` are suitable for
+time-to-target profiles; report-writing time is outside Ceres' solver time.
 
 ## Diagnostic Run
 
@@ -280,5 +308,8 @@ diagnostic guidance.
   component of the second valid camera by default. Set
   `CEP_FIX_MONOCULAR_GAUGE=0` only when the formulation is constrained another
   way.
+- GCP-controlled runs disable the free-network gauge by default because fixed
+  control points define the datum. Set `CEP_FIX_CONTROLLED_GAUGE=1` only for
+  a deliberately over-constrained diagnostic run.
 - The dataset collection and generated outputs are intentionally kept outside
   Git because they are large and environment-specific.

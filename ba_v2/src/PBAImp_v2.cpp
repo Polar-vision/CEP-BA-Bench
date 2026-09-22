@@ -5,11 +5,14 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -64,6 +67,69 @@ double environment_double(const char* name, double fallback) {
 	} catch (...) {
 		return fallback;
 	}
+}
+
+const char* termination_type_name(ceres::TerminationType type) {
+	switch (type) {
+	case ceres::CONVERGENCE:
+		return "CONVERGENCE";
+	case ceres::NO_CONVERGENCE:
+		return "NO_CONVERGENCE";
+	case ceres::FAILURE:
+		return "FAILURE";
+	case ceres::USER_SUCCESS:
+		return "USER_SUCCESS";
+	case ceres::USER_FAILURE:
+		return "USER_FAILURE";
+	}
+	return "UNKNOWN";
+}
+
+std::string single_line(std::string value) {
+	for (char& character : value) {
+		if (character == '\r' || character == '\n') {
+			character = ' ';
+		}
+	}
+	return value;
+}
+
+std::string json_escape(const std::string& value) {
+	std::string escaped;
+	escaped.reserve(value.size() + 8);
+	for (const unsigned char character : value) {
+		switch (character) {
+		case '\"':
+			escaped += "\\\"";
+			break;
+		case '\\':
+			escaped += "\\\\";
+			break;
+		case '\b':
+			escaped += "\\b";
+			break;
+		case '\f':
+			escaped += "\\f";
+			break;
+		case '\n':
+			escaped += "\\n";
+			break;
+		case '\r':
+			escaped += "\\r";
+			break;
+		case '\t':
+			escaped += "\\t";
+			break;
+		default:
+			if (character < 0x20) {
+				escaped += ' ';
+			} else {
+				escaped += static_cast<char>(character);
+			}
+			break;
+		}
+	}
+	return escaped;
 }
 
 constexpr double kDiagnosticEpsilon = 1e-30;
@@ -274,6 +340,121 @@ private:
 	std::vector<DiagnosticIterationState> states_;
 };
 
+StrictDiagnosticMetrics summarize_iteration_metrics(
+	const ceres::Solver::Summary& summary,
+	double gradient_tolerance) {
+	StrictDiagnosticMetrics result;
+	if (summary.iterations.empty()) {
+		return result;
+	}
+
+	const auto& first = summary.iterations.front();
+	const auto& last = summary.iterations.back();
+	result.initial_gradient_max_norm = first.gradient_max_norm;
+	result.final_gradient_reduction_ratio =
+		(first.gradient_max_norm - last.gradient_max_norm) /
+		(first.gradient_max_norm + kDiagnosticEpsilon);
+	result.final_lm_gain_ratio = last.relative_decrease;
+
+	const double previous_cost =
+		summary.iterations.size() > 1
+		? summary.iterations[summary.iterations.size() - 2].cost
+		: last.cost;
+	result.final_relative_function_decrease =
+		summary.iterations.size() > 1
+		? (previous_cost - last.cost) /
+			std::max(std::abs(previous_cost), kDiagnosticEpsilon)
+		: 0.0;
+
+	for (const auto& iteration : summary.iterations) {
+		if (iteration.gradient_max_norm <= gradient_tolerance) {
+			result.reached_gradient_tolerance = 1;
+			result.iterations_to_gradient_tolerance = iteration.iteration;
+			break;
+		}
+	}
+	return result;
+}
+
+void write_lightweight_iteration_log(
+	const ceres::Solver::Summary& summary,
+	int nobs,
+	const std::string& parent) {
+	const std::string path = parent + "/convergence.csv";
+	FILE* fp = nullptr;
+	fopen_s(&fp, path.c_str(), "w");
+	if (fp == nullptr) {
+		return;
+	}
+
+	fprintf(fp,
+		"iteration,cost,rmse_px,cost_change,relative_function_decrease,"
+		"normalized_convergence_progress,gradient_max_norm,gradient_norm,"
+		"gradient_reduction_ratio,step_norm,step_tangent_norm,x_norm,"
+		"relative_step_size,gradient_lipschitz_estimate,direction_quality,"
+		"lm_gain_ratio,gain_ratio,trust_region_radius,lm_damping,"
+		"linear_solver_eta,linear_solver_iterations,step_valid,step_successful,"
+		"iteration_time_sec,step_solver_time_sec,cumulative_time_sec\n");
+
+	if (summary.iterations.empty()) {
+		fclose(fp);
+		return;
+	}
+
+	const double initial_cost = summary.initial_cost;
+	const double initial_gradient = summary.iterations.front().gradient_max_norm;
+	const double total_cost_reduction =
+		std::max(std::abs(initial_cost - summary.final_cost), kDiagnosticEpsilon);
+
+	for (std::size_t i = 0; i < summary.iterations.size(); ++i) {
+		const auto& it = summary.iterations[i];
+		const double rmse =
+			nobs > 0 ? std::sqrt(2.0 * it.cost / nobs) : nan_value();
+		const double previous_cost =
+			i > 0 ? summary.iterations[i - 1].cost : it.cost;
+		const double relative_function_decrease =
+			i > 0
+			? (previous_cost - it.cost) /
+				std::max(std::abs(previous_cost), kDiagnosticEpsilon)
+			: 0.0;
+		const double normalized_progress =
+			(initial_cost - it.cost) / total_cost_reduction;
+		const double gradient_reduction_ratio =
+			(initial_gradient - it.gradient_max_norm) /
+			(initial_gradient + kDiagnosticEpsilon);
+		const double lm_damping =
+			it.trust_region_radius > 0.0 ? 1.0 / it.trust_region_radius : 0.0;
+
+		fprintf(fp,
+			"%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
+			"%.17g,%.17g,nan,nan,nan,nan,nan,"
+			"%.17g,%.17g,%.17g,%.17g,%.17g,%d,%d,%d,"
+			"%.17g,%.17g,%.17g\n",
+			it.iteration,
+			it.cost,
+			rmse,
+			it.cost_change,
+			relative_function_decrease,
+			normalized_progress,
+			it.gradient_max_norm,
+			it.gradient_norm,
+			gradient_reduction_ratio,
+			it.step_norm,
+			it.relative_decrease,
+			it.relative_decrease,
+			it.trust_region_radius,
+			lm_damping,
+			it.eta,
+			it.linear_solver_iterations,
+			it.step_is_valid ? 1 : 0,
+			it.step_is_successful ? 1 : 0,
+			it.iteration_time_in_seconds,
+			it.step_solver_time_in_seconds,
+			it.cumulative_time_in_seconds);
+	}
+	fclose(fp);
+}
+
 StrictDiagnosticMetrics write_strict_diagnostics(
 	ceres::Problem& problem,
 	const std::vector<DiagnosticParameterBlock>& blocks,
@@ -377,7 +558,8 @@ StrictDiagnosticMetrics write_strict_diagnostics(
 		"gradient_reduction_ratio,step_norm,step_tangent_norm,x_norm,"
 		"relative_step_size,gradient_lipschitz_estimate,direction_quality,"
 		"lm_gain_ratio,gain_ratio,trust_region_radius,lm_damping,"
-		"linear_solver_eta,linear_solver_iterations,step_valid,step_successful\n";
+		"linear_solver_eta,linear_solver_iterations,step_valid,step_successful,"
+		"iteration_time_sec,step_solver_time_sec,cumulative_time_sec\n";
 	if (convergence_fp != nullptr) {
 		fprintf(convergence_fp, "%s", header);
 	}
@@ -446,7 +628,8 @@ StrictDiagnosticMetrics write_strict_diagnostics(
 			fprintf(fp,
 				"%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
 				"%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
-				"%.17g,%.17g,%.17g,%.17g,%.17g,%d,%d,%d\n",
+				"%.17g,%.17g,%.17g,%.17g,%.17g,%d,%d,%d,"
+				"%.17g,%.17g,%.17g\n",
 				it.iteration,
 				it.cost,
 				rmse,
@@ -469,7 +652,10 @@ StrictDiagnosticMetrics write_strict_diagnostics(
 				it.eta,
 				it.linear_solver_iterations,
 				it.step_is_valid ? 1 : 0,
-				it.step_is_successful ? 1 : 0);
+				it.step_is_successful ? 1 : 0,
+				it.iteration_time_in_seconds,
+				it.step_solver_time_in_seconds,
+				it.cumulative_time_in_seconds);
 		};
 		write_row(convergence_fp);
 		write_row(strict_fp);
@@ -536,6 +722,132 @@ AnchorPolicy anchor_policy_from_environment() {
 	return AnchorPolicy::kCurrent;
 }
 
+struct GcpRecord {
+	double xyz[3] = {0.0, 0.0, 0.0};
+	double h_accuracy = 0.0;
+	double v_accuracy = 0.0;
+	bool is_checkpoint = false;
+};
+
+bool parse_gcp_records(
+	const char* gcp_path,
+	std::unordered_map<int, GcpRecord>* records) {
+	if (gcp_path == nullptr || records == nullptr) {
+		return false;
+	}
+	records->clear();
+	std::ifstream input(gcp_path);
+	if (!input) {
+		fprintf(stderr, "BA error: cannot open GCP file %s\n", gcp_path);
+		return false;
+	}
+
+	std::string line;
+	while (std::getline(input, line)) {
+		if (line.empty() || line[0] == '#') {
+			continue;
+		}
+		std::istringstream stream(line);
+		int id = -1;
+		std::string name;
+		GcpRecord record;
+		int is_checkpoint = 0;
+		if (!(stream >> id >> name >>
+			record.xyz[0] >> record.xyz[1] >> record.xyz[2] >>
+			record.h_accuracy >> record.v_accuracy >> is_checkpoint)) {
+			continue;
+		}
+		record.is_checkpoint = is_checkpoint != 0;
+		(*records)[id] = record;
+	}
+
+	if (records->empty()) {
+		fprintf(stderr, "BA error: no usable GCP records in %s\n", gcp_path);
+		return false;
+	}
+	return true;
+}
+
+bool parse_gcp_tracks(
+	const char* observations_path,
+	const std::unordered_map<int, GcpRecord>& records,
+	std::vector<IBA::GroundControlTrack>* control_tracks,
+	std::vector<IBA::GroundControlTrack>* checkpoint_tracks) {
+	if (observations_path == nullptr ||
+		control_tracks == nullptr ||
+		checkpoint_tracks == nullptr) {
+		return false;
+	}
+	control_tracks->clear();
+	checkpoint_tracks->clear();
+
+	std::ifstream input(observations_path);
+	if (!input) {
+		fprintf(stderr, "BA error: cannot open GCP observations file %s\n",
+			observations_path);
+		return false;
+	}
+
+	std::string line;
+	while (std::getline(input, line)) {
+		if (line.empty() || line[0] == '#') {
+			continue;
+		}
+		std::istringstream stream(line);
+		int id = -1;
+		int nview = 0;
+		if (!(stream >> id >> nview)) {
+			continue;
+		}
+		const auto record_it = records.find(id);
+		if (record_it == records.end()) {
+			continue;
+		}
+
+		IBA::GroundControlTrack track;
+		track.control_id = id;
+		track.is_checkpoint = record_it->second.is_checkpoint;
+		track.xyz[0] = record_it->second.xyz[0];
+		track.xyz[1] = record_it->second.xyz[1];
+		track.xyz[2] = record_it->second.xyz[2];
+		for (int i = 0; i < nview; ++i) {
+			IBA::Observation observation;
+			if (!(stream >> observation.view_idx >> observation.u >> observation.v)) {
+				break;
+			}
+			track.obss.push_back(observation);
+		}
+		if (track.obss.empty()) {
+			continue;
+		}
+		if (track.is_checkpoint) {
+			checkpoint_tracks->push_back(track);
+		} else {
+			control_tracks->push_back(track);
+		}
+	}
+
+	if (control_tracks->empty()) {
+		fprintf(stderr, "BA error: no usable non-checkpoint GCP control tracks in %s\n",
+			observations_path);
+		return false;
+	}
+	return true;
+}
+
+bool load_gcp_control_tracks(
+	const char* gcp_path,
+	const char* observations_path,
+	std::vector<IBA::GroundControlTrack>* control_tracks,
+	std::vector<IBA::GroundControlTrack>* checkpoint_tracks) {
+	std::unordered_map<int, GcpRecord> records;
+	if (!parse_gcp_records(gcp_path, &records)) {
+		return false;
+	}
+	return parse_gcp_tracks(
+		observations_path, records, control_tracks, checkpoint_tracks);
+}
+
 }  // namespace
 
 PBA::PBA(void)
@@ -553,6 +865,8 @@ PBA::PBA(void)
 	m_bProvideXYZ = false;
 	m_bFocal = false;
 	m_szCameraInit = m_szFeatures = m_szCalibration = m_szXYZ = m_sz3Dpts = m_szCamePose = m_szReport = nullptr;
+	m_szGcp = m_szGcpObservations = nullptr;
+	m_useGcpControl = false;
 	m_last_metrics = BARunMetrics{};
 }
 
@@ -855,7 +1169,10 @@ bool PBA::ba_run(char* szCam,
     MethodId method,
 	BenchmarkOutputMode output_mode,
 	int point_condition_sample,
-	int schur_sample)
+	int schur_sample,
+	char* szGcp,
+	char* szGcpObservations,
+	bool use_gcp_control)
 {
 	m_last_metrics = BARunMetrics{};
 	m_szCameraInit = szCam;
@@ -865,8 +1182,15 @@ bool PBA::ba_run(char* szCam,
 	m_szCamePose = szPose;
 	m_sz3Dpts = sz3D;
 	m_szReport = szReport;
+	m_szGcp = szGcp;
+	m_szGcpObservations = szGcpObservations;
+	m_useGcpControl = use_gcp_control;
+	ground_control_tracks.clear();
+	checkpoint_tracks.clear();
 
 	const bool diagnostics = output_mode == BenchmarkOutputMode::Diagnostic;
+	const bool clean_logged = output_mode == BenchmarkOutputMode::CleanLogged;
+	const bool writes_run_files = diagnostics || clean_logged;
 	const objectpointtype optype = method_object_point_type(method);
 	const char* method_name = method_id_name(method);
 
@@ -877,6 +1201,14 @@ bool PBA::ba_run(char* szCam,
 	}
 
 	if (!ba_initialize(m_szCameraInit, m_szFeatures, m_szCalibration, m_szXYZ)) {
+		return false;
+	}
+	if (m_useGcpControl &&
+		!load_gcp_control_tracks(
+			m_szGcp,
+			m_szGcpObservations,
+			&ground_control_tracks,
+			&checkpoint_tracks)) {
 		return false;
 	}
 
@@ -1149,12 +1481,68 @@ bool PBA::ba_run(char* szCam,
 		}
 	}
 
+	int gcp_control_observations = 0;
+	if (m_useGcpControl) {
+		for (const GroundControlTrack& track : ground_control_tracks) {
+			for (const Observation& observation : track.obss) {
+				const int nP = observation.view_idx;
+				if (nP < 0 || nP >= static_cast<int>(cams.size())) {
+					fprintf(stderr,
+						"BA error: GCP %d observation references invalid camera index %d\n",
+						track.control_id,
+						nP);
+					return false;
+				}
+				const int cam_idx = cams[nP].camidx;
+				if (cam_idx <= 0 || cam_idx > static_cast<int>(intrs.size())) {
+					fprintf(stderr,
+						"BA error: camera %d references invalid calibration index %d\n",
+						nP,
+						cam_idx);
+					return false;
+				}
+
+				const double fx = intrs[cam_idx - 1].fx;
+				const double fy = intrs[cam_idx - 1].fy;
+				const double cx = intrs[cam_idx - 1].cx;
+				const double cy = intrs[cam_idx - 1].cy;
+				ceres::CostFunction* cost_function =
+					fixed_xyz_euler_angle_uv::Create(
+						observation.u,
+						observation.v,
+						fx,
+						fy,
+						cx,
+						cy,
+						track.xyz);
+				problem.AddResidualBlock(cost_function, nullptr,
+					&cams[nP].euler_angle[0],
+					&cams[nP].camera_center[0]);
+				++gcp_control_observations;
+				++nobs;
+			}
+		}
+		if (gcp_control_observations == 0) {
+			fprintf(stderr, "BA error: no non-checkpoint GCP observations were loaded\n");
+			return false;
+		}
+		if (diagnostics) {
+			printf("GCP control: %d control points, %d observations; %d checkpoints held out\n",
+				static_cast<int>(ground_control_tracks.size()),
+				gcp_control_observations,
+				static_cast<int>(checkpoint_tracks.size()));
+		}
+	}
+
 	if (nobs == 0) {
 		fprintf(stderr, "BA error: no observations were loaded\n");
 		return false;
 	}
 
-	if (environment_flag("CEP_FIX_MONOCULAR_GAUGE", true) && !cams.empty()) {
+	const bool apply_free_network_gauge =
+		environment_flag("CEP_FIX_MONOCULAR_GAUGE", true) &&
+		(!m_useGcpControl || environment_flag("CEP_FIX_CONTROLLED_GAUGE", false));
+	if (apply_free_network_gauge && !cams.empty()) {
 		if (problem.HasParameterBlock(&cams[0].euler_angle[0])) {
 			problem.SetParameterBlockConstant(&cams[0].euler_angle[0]);
 		}
@@ -1256,6 +1644,10 @@ bool PBA::ba_run(char* szCam,
 		final_gradient_norm = summary.iterations.back().gradient_norm;
 	}
 	StrictDiagnosticMetrics strict_metrics;
+	if (clean_logged) {
+		strict_metrics =
+			summarize_iteration_metrics(summary, options.gradient_tolerance);
+	}
 	if (diagnostics && m_szReport != nullptr) {
 		const std::string parent = diagnostic_parent_directory(m_szReport);
 		const std::vector<DiagnosticIterationState> empty_states;
@@ -1267,6 +1659,12 @@ bool PBA::ba_run(char* szCam,
 			nobs,
 			options.gradient_tolerance,
 			parent);
+	}
+	if (clean_logged && m_szReport != nullptr) {
+		write_lightweight_iteration_log(
+			summary,
+			nobs,
+			diagnostic_parent_directory(m_szReport));
 	}
 
 	m_last_metrics.success = summary.IsSolutionUsable();
@@ -1303,6 +1701,18 @@ bool PBA::ba_run(char* szCam,
 		strict_metrics.final_direction_quality;
 	m_last_metrics.solver_time_sec = summary.total_time_in_seconds;
 	m_last_metrics.linear_solver_time_sec = summary.linear_solver_time_in_seconds;
+	m_last_metrics.num_threads = options.num_threads;
+	m_last_metrics.max_num_iterations = options.max_num_iterations;
+	m_last_metrics.function_tolerance = options.function_tolerance;
+	m_last_metrics.gradient_tolerance = options.gradient_tolerance;
+	m_last_metrics.parameter_tolerance = options.parameter_tolerance;
+	m_last_metrics.min_relative_decrease = options.min_relative_decrease;
+	m_last_metrics.initial_trust_region_radius =
+		options.initial_trust_region_radius;
+	m_last_metrics.jacobi_scaling = options.jacobi_scaling;
+	m_last_metrics.termination_type_name =
+		termination_type_name(summary.termination_type);
+	m_last_metrics.termination_message = single_line(summary.message);
 
 	if (diagnostics && point_condition_sample > 0 && m_szReport != nullptr) {
 		const std::string report_path(m_szReport);
@@ -1745,7 +2155,7 @@ bool PBA::ba_run(char* szCam,
 		}
 	}
 
-	if (diagnostics && m_szReport != nullptr) {
+	if (writes_run_files && m_szReport != nullptr) {
 		std::string report_path(m_szReport);
 		FILE* fp = nullptr;
 		fopen_s(&fp, report_path.c_str(), "w");
@@ -1754,6 +2164,14 @@ bool PBA::ba_run(char* szCam,
 			fprintf(fp, "cameras %d\n", m_ncams);
 			fprintf(fp, "points %d\n", m_n3Dpts);
 			fprintf(fp, "observations %d\n", nobs);
+			if (m_useGcpControl) {
+				fprintf(fp, "gcp_control_points %d\n",
+					static_cast<int>(ground_control_tracks.size()));
+				fprintf(fp, "gcp_control_observations %d\n",
+					gcp_control_observations);
+				fprintf(fp, "checkpoints_held_out %d\n",
+					static_cast<int>(checkpoint_tracks.size()));
+			}
 			fprintf(fp, "initial_cost %.15lf\n", summary.initial_cost);
 			fprintf(fp, "final_cost %.15lf\n", summary.final_cost);
 			fprintf(fp, "initial_rmse_px %.15lf\n", initial_rmse);
@@ -1785,7 +2203,24 @@ bool PBA::ba_run(char* szCam,
 			fprintf(fp, "solver_time_sec %.15lf\n", summary.total_time_in_seconds);
 			fprintf(fp, "linear_solver_time_sec %.15lf\n", summary.linear_solver_time_in_seconds);
 			fprintf(fp, "termination_type %d\n", static_cast<int>(summary.termination_type));
-			fprintf(fp, "brief_report %s\n", summary.BriefReport().c_str());
+			fprintf(fp, "termination_type_name %s\n",
+				termination_type_name(summary.termination_type));
+			fprintf(fp, "termination_message %s\n",
+				single_line(summary.message).c_str());
+			fprintf(fp, "brief_report %s\n",
+				single_line(summary.BriefReport()).c_str());
+			fprintf(fp, "num_threads %d\n", options.num_threads);
+			fprintf(fp, "max_num_iterations %d\n", options.max_num_iterations);
+			fprintf(fp, "function_tolerance %.17g\n", options.function_tolerance);
+			fprintf(fp, "gradient_tolerance %.17g\n", options.gradient_tolerance);
+			fprintf(fp, "parameter_tolerance %.17g\n", options.parameter_tolerance);
+			fprintf(fp, "min_relative_decrease %.17g\n",
+				options.min_relative_decrease);
+			fprintf(fp, "initial_trust_region_radius %.17g\n",
+				options.initial_trust_region_radius);
+			fprintf(fp, "jacobi_scaling %d\n", options.jacobi_scaling ? 1 : 0);
+			fprintf(fp, "full_report_begin\n%s\nfull_report_end\n",
+				summary.FullReport().c_str());
 			fclose(fp);
 		}
 
@@ -1796,7 +2231,8 @@ bool PBA::ba_run(char* szCam,
 		if (fp != nullptr) {
 			fprintf(fp, "{\n");
 			fprintf(fp, "  \"method\": \"%s\",\n", method_name);
-			fprintf(fp, "  \"mode\": \"diagnostic\",\n");
+			fprintf(fp, "  \"mode\": \"%s\",\n",
+				clean_logged ? "clean-logged" : "diagnostic");
 			fprintf(fp, "  \"ceres_version\": \"%s\",\n", CERES_VERSION_STRING);
 			fprintf(fp, "  \"solver\": {\n");
 			fprintf(fp, "    \"trust_region_strategy\": \"LEVENBERG_MARQUARDT\",\n");
@@ -1816,7 +2252,17 @@ bool PBA::ba_run(char* szCam,
 			fprintf(fp, "  \"problem\": {\n");
 			fprintf(fp, "    \"cameras\": %d,\n", m_ncams);
 			fprintf(fp, "    \"points\": %d,\n", m_n3Dpts);
-			fprintf(fp, "    \"observations\": %d\n", nobs);
+			if (m_useGcpControl) {
+				fprintf(fp, "    \"observations\": %d,\n", nobs);
+				fprintf(fp, "    \"gcp_control_points\": %d,\n",
+					static_cast<int>(ground_control_tracks.size()));
+				fprintf(fp, "    \"gcp_control_observations\": %d,\n",
+					gcp_control_observations);
+				fprintf(fp, "    \"checkpoints_held_out\": %d\n",
+					static_cast<int>(checkpoint_tracks.size()));
+			} else {
+				fprintf(fp, "    \"observations\": %d\n", nobs);
+			}
 			fprintf(fp, "  },\n");
 			fprintf(fp, "  \"result\": {\n");
 			fprintf(fp, "    \"success\": %s,\n",
@@ -1854,8 +2300,15 @@ bool PBA::ba_run(char* szCam,
 				strict_metrics.final_gradient_lipschitz_estimate);
 			fprintf(fp, "    \"final_direction_quality\": %.17g,\n",
 				strict_metrics.final_direction_quality);
-			fprintf(fp, "    \"termination_type\": %d\n",
+			fprintf(fp, "    \"termination_type\": %d,\n",
 				static_cast<int>(summary.termination_type));
+			fprintf(fp, "    \"termination_type_name\": \"%s\",\n",
+				termination_type_name(summary.termination_type));
+			fprintf(fp, "    \"termination_message\": \"%s\",\n",
+				json_escape(summary.message).c_str());
+			fprintf(fp, "    \"brief_report\": \"%s\",\n",
+				json_escape(summary.BriefReport()).c_str());
+			fprintf(fp, "    \"full_report_path\": \"report.txt\"\n");
 			fprintf(fp, "  },\n");
 			fprintf(fp, "  \"diagnostics\": {\n");
 			fprintf(fp, "    \"strict_vector_diagnostics\": %s,\n",
@@ -1901,6 +2354,8 @@ bool PBA::ba_initialize( char* szCamera, char* szFeature,  char* szCalib, char* 
 	cams.clear();
 	tracks.clear();
 	intrs.clear();
+	ground_control_tracks.clear();
+	checkpoint_tracks.clear();
 	m_bProvideXYZ = false;
 	m_bFocal = false;
 

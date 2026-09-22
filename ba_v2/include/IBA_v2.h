@@ -36,7 +36,10 @@ public:
 						MethodId method,
 						BenchmarkOutputMode output_mode,
 						int point_condition_sample,
-						int schur_sample)=0;
+						int schur_sample,
+						char* szGcp,
+						char* szGcpObservations,
+						bool use_gcp_control)=0;
 
 	virtual bool ba_initialize(char* szCamera, char* szFeature, char* szCalib = NULL, char* szXYZ = NULL)=0;
 	const BARunMetrics& last_metrics() const { return m_last_metrics; }
@@ -73,6 +76,9 @@ public:
 	char* m_szCamePose;
 	char* m_sz3Dpts;
 	char* m_szReport;
+	char* m_szGcp;
+	char* m_szGcpObservations;
+	bool m_useGcpControl;
 	BARunMetrics m_last_metrics;
 
 	struct Intrinsic{
@@ -112,8 +118,16 @@ public:
 		int nview;
 		std::vector<Observation> obss;
 	};
+	struct GroundControlTrack{
+		int control_id;
+		bool is_checkpoint;
+		double xyz[3];
+		std::vector<Observation> obss;
+	};
 	std::vector<Intrinsic> intrs;
 	std::vector<Camera> cams;
 	std::vector<Point3D> points;
 	std::vector<Track> tracks;
+	std::vector<GroundControlTrack> ground_control_tracks;
+	std::vector<GroundControlTrack> checkpoint_tracks;
 };

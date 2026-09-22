@@ -7,6 +7,12 @@ per-run console diagnostics and does not write reports, convergence curves,
 poses, or point clouds. The runner writes only the aggregate `summary.csv`
 after each solve has finished.
 
+`clean-logged` mode uses the same solver settings and does not enable strict
+vector diagnostics. It additionally writes lightweight per-run logs after
+`Solve()` returns: Ceres' per-iteration RMSE and wall-time fields,
+`termination_message`, the solver tolerances, and the full solver report.
+The Ceres-reported solver time remains separate from report-writing time.
+
 `diagnostic` mode writes `report.txt`, `metrics.json`, `convergence.txt`,
 `FinalPose.txt`, and `Final3D.ply`. With
 `--point-condition-sample N`, it also evaluates sampled point-block Hessians.
@@ -38,6 +44,11 @@ analysis.
 For datasets containing independent check points, object-space RMSE should be
 reported separately from the reprojection metrics. GCPs used as constraints
 must not also be treated as independent check points.
+
+When fixed GCP control residuals are enabled, the control points define the
+network datum and the free-network monocular gauge fix should be disabled.
+Retain the free-network gauge only for unconstrained runs or explicit
+over-constrained diagnostics.
 
 ## Representative diagnostic subset
 

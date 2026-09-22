@@ -25,7 +25,10 @@ public:
 						MethodId method,
 						BenchmarkOutputMode output_mode,
 						int point_condition_sample,
-						int schur_sample) override;
+						int schur_sample,
+						char* szGcp,
+						char* szGcpObservations,
+						bool use_gcp_control) override;
 
 
 	virtual bool ba_initialize( char* szCamera, char* szFeature, char* szCalib = NULL, char* szXYZ = NULL );
@@ -126,6 +129,46 @@ public:
 
 	double u, v;
 	double fx, fy, cx, cy;
+	};
+	struct fixed_xyz_euler_angle_uv {
+	fixed_xyz_euler_angle_uv(double observed_u, double observed_v,
+					double fx, double fy, double cx, double cy,
+					const double fixed_xyz[3])
+		: u(observed_u), v(observed_v),
+		fx(fx), fy(fy), cx(cx), cy(cy) {
+		xyz_const[0] = fixed_xyz[0];
+		xyz_const[1] = fixed_xyz[1];
+		xyz_const[2] = fixed_xyz[2];
+	}
+
+	template <typename T>
+	bool operator()(const T* const euler_angles,
+					const T* const camera_center,
+					T* residuals) const {
+		T R[9];
+		cep::cost::EulerToWorldToCamera(euler_angles, R);
+
+		T Xc[3];
+		Xc[0] = T(xyz_const[0]) - camera_center[0];
+		Xc[1] = T(xyz_const[1]) - camera_center[1];
+		Xc[2] = T(xyz_const[2]) - camera_center[2];
+
+		T p[3];
+		cep::cost::MatVec(R, Xc, p);
+		cep::cost::Project(p, fx, fy, cx, cy, u, v, residuals);
+		return true;
+	}
+
+	static ceres::CostFunction* Create(double u, double v,
+									double fx, double fy, double cx, double cy,
+									const double fixed_xyz[3]) {
+		return new ceres::AutoDiffCostFunction<fixed_xyz_euler_angle_uv, 2, 3, 3>(
+			new fixed_xyz_euler_angle_uv(u, v, fx, fy, cx, cy, fixed_xyz));
+	}
+
+	double u, v;
+	double fx, fy, cx, cy;
+	double xyz_const[3];
 	};
 	struct xy_inverse_z_euler_angle_uv {
 	xy_inverse_z_euler_angle_uv(double observed_u, double observed_v,
