@@ -1,0 +1,13 @@
+{
+  "protocol": "D144-13control-10checkpoint",
+  "id_convention": "zero-based GCP_ID in the source gcp.txt",
+  "control_ids": [1, 4, 5, 7, 8, 9, 10, 13, 14, 16, 17, 19, 22],
+  "checkpoint_ids": [0, 2, 3, 6, 11, 12, 15, 18, 20, 21],
+  "images": 2823,
+  "points": 188150,
+  "tie_observations": 1073331,
+  "control_observations": 201,
+  "checkpoint_observations": 124,
+  "seed": 20260603,
+  "target_rmse_px": [2, 5, 10, 20, 50, 100, 200, 500]
+}

@@ -6,6 +6,10 @@
 per-run console diagnostics and does not write reports, convergence curves,
 poses, or point clouds. The runner writes only the aggregate `summary.csv`
 after each solve has finished.
+With `--export-final-pose`, it additionally exports final camera poses after
+the timed Ceres solve, for held-out checkpoint evaluation without diagnostic
+instrumentation. Use `solver_time_sec` for comparisons; `wall_time_sec` also
+includes setup and any requested export work.
 
 `clean-logged` mode uses the same solver settings and does not enable strict
 vector diagnostics. It additionally writes lightweight per-run logs after
@@ -35,11 +39,15 @@ collected for all Initial Value problems:
 
 Execution success only means that the benchmark process returned normally.
 Ceres convergence additionally requires `termination_type == CONVERGENCE`.
-For matched runs on the same benchmark problem, an equivalent solution requires
-both Ceres convergence and a final reprojection RMSE no more than 1% above the
-best final RMSE obtained by any compared method. The relative tolerance must
-be reported and sensitivity to this threshold should be checked in the final
-analysis.
+For matched runs on the same problem, the paper reports final reprojection
+RMSE within 1% and 5% of the problem-best final RMSE, independently of Ceres
+termination status. A `CONVERGENCE` run may still stop at high RMSE. Strict
+first-passage profiles use the earliest accepted logged iterate reaching the
+same RMSE target and normalize by the fastest time to that target; unsuccessful
+pairs have infinite ratio. Endpoint profiles compare final outputs and use the
+fastest total solve as denominator, including runs missing the accuracy band.
+The tolerance is on RMSE, so the objective ratios are 1.0201 and 1.1025 with
+unchanged observations and identity loss.
 
 For datasets containing independent check points, object-space RMSE should be
 reported separately from the reprojection metrics. GCPs used as constraints
@@ -49,6 +57,22 @@ When fixed GCP control residuals are enabled, the control points define the
 network datum and the free-network monocular gauge fix should be disabled.
 Retain the free-network gauge only for unconstrained runs or explicit
 over-constrained diagnostics.
+
+The controlled D144 protocol and its released runner are documented in
+[d144_reproduction.md](d144_reproduction.md). Its direct checkpoint evaluation
+does not apply a similarity transform.
+
+## Common solver settings
+
+The paper uses Ceres 2.3.0, `SPARSE_SCHUR`, LM, fixed intrinsics, unit image
+residual weights, no robust loss, and one thread. Its iteration limit is 100,
+with function tolerance `1e-6`, gradient tolerance `1e-10`, parameter tolerance
+`1e-8`, initial trust-region radius `1e4`, minimum relative decrease `1e-3`,
+and Jacobi scaling. The D144 wrapper explicitly sets supported environment
+overrides to these values so inherited settings cannot alter the protocol.
+General C++ runs default to the host's thread count unless `CEP_NUM_THREADS`
+is set. Diagnostic vector logging is enabled by default only in diagnostic
+mode and is excluded from primary timing comparisons.
 
 ## Representative diagnostic subset
 

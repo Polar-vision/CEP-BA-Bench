@@ -1,51 +1,29 @@
-cmake_minimum_required(VERSION 3.10)
-project(example)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SUBSYSTEM:CONSOLE")
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+cmake_minimum_required(VERSION 3.21)
 
-set(CEP_THIRDPARTY_DIR "E:/zuo/projects/backup/3rdparty" CACHE PATH "Directory containing third-party headers")
-set(CEP_VCPKG_INSTALLED_DIR "E:/zuo/vcpkg/installed" CACHE PATH "vcpkg installed directory")
-set(CEP_VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg target triplet")
-set(cudss_DIR "E:/zuo/Program Files/NVIDIA cuDSS/v0.5/lib/12/cmake/cudss" CACHE PATH "cuDSS CMake package directory")
-set(Ceres_DIR "E:/zuo/projects/ceres-solver/install/lib/cmake/Ceres" CACHE PATH "Ceres CMake package directory")
+# Keep the documented example_v2 build entry point, while also allowing the
+# entire benchmark to be configured from the repository root.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(CEP_BA_Bench LANGUAGES CXX)
+    include("${CMAKE_CURRENT_LIST_DIR}/../cmake/CEPBuildSettings.cmake")
+    add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../ba_v2" ba_v2)
+endif()
 
-set(CEP_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
-set(BA_INCLUDE_DIR "${CEP_ROOT}/ba_v2/include")
+add_executable(example example.cpp)
+target_compile_features(example PRIVATE cxx_std_17)
+target_link_libraries(example PRIVATE ba)
 
-# 确保 Vcpkg 的路径优先于系统路径
-list(INSERT CMAKE_PREFIX_PATH 0 "${CEP_VCPKG_INSTALLED_DIR}/${CEP_VCPKG_TARGET_TRIPLET}")
-list(INSERT CMAKE_MODULE_PATH 0 "${CEP_VCPKG_INSTALLED_DIR}/${CEP_VCPKG_TARGET_TRIPLET}/share")
-# 查找 Ceres
-find_package(Ceres REQUIRED)
+if(MSVC)
+    target_compile_options(example PRIVATE /utf-8)
+endif()
 
-
-# 源文件
-set(SOURCES
-    example.cpp
-)
-
-add_subdirectory("${CEP_ROOT}/ba_v2" "${CMAKE_BINARY_DIR}/ba_v2_build")
-
-# 创建可执行程序
-add_executable(example ${SOURCES})
-set_target_properties(example PROPERTIES LINK_FLAGS "/SAFESEH:NO")
-
-# 头文件路径
-target_include_directories(example PRIVATE
-    ${BA_INCLUDE_DIR}
-    ${CEP_THIRDPARTY_DIR}
-    ${CEP_VCPKG_INSTALLED_DIR}/${CEP_VCPKG_TARGET_TRIPLET}/include
-)
-
-target_link_libraries(example PRIVATE 
-    ba
-    ${CERES_LIBRARIES}
-)
-
-add_custom_command(TARGET example POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_RUNTIME_DLLS:example> $<TARGET_FILE_DIR:example>
-    COMMAND_EXPAND_LISTS
-)
+# Imported shared-library targets can provide their runtime DLL locations.
+# The helper also handles a Ceres installation with no runtime DLLs to copy.
+if(WIN32)
+    add_custom_command(TARGET example POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+            "-DDLLS=$<TARGET_RUNTIME_DLLS:example>"
+            "-DOUTPUT_DIR=$<TARGET_FILE_DIR:example>"
+            -P "${CMAKE_CURRENT_LIST_DIR}/../cmake/CopyRuntimeDlls.cmake"
+        VERBATIM
+    )
+endif()

@@ -144,6 +144,7 @@ void print_usage(const char* exe) {
         << "Usage: " << exe << " [--problems <input-root>] [--out <results>]\n"
         << "                  [--method <MethodId>] [--limit <N>] [--dataset <name>]\n"
         << "                  [--mode clean|clean-logged|diagnostic] [--resume]\n"
+        << "                  [--export-final-pose]\n"
         << "                  [--no-xyz]\n"
         << "                  [--point-condition-sample <N>]\n"
         << "                  [--schur-sample <N>]\n"
@@ -160,6 +161,8 @@ void print_usage(const char* exe) {
         << "Modes: clean writes only summary.csv; clean-logged writes lightweight\n"
         << "       per-run convergence.csv and termination logs; diagnostic also\n"
         << "       writes strict diagnostics, report, metrics, and final files.\n"
+        << "--export-final-pose additionally writes FinalPose.txt for each run\n"
+        << "       without enabling diagnostic output.\n"
         << "--use-gcp-control adds fixed 3D GCP projection residuals from non-checkpoints;\n"
         << "       checkpoints are held out and never added to the optimization.\n"
         << "--resume retains successful rows, reruns failures, and skips completed runs.\n";
@@ -336,8 +339,8 @@ std::vector<DatasetPaths> discover_datasets(const fs::path& problems_root,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    fs::path problems_root = "E:/zuo/projects/CEP/BA Datasets";
-    fs::path output_root = "E:/zuo/projects/CEP/benchmark_initial_value_clean";
+    fs::path problems_root = "BA Datasets";
+    fs::path output_root = "benchmark_results";
     std::vector<MethodId> selected_methods = all_methods();
     std::string dataset_filter;
     BenchmarkOutputMode output_mode = BenchmarkOutputMode::CleanTiming;
@@ -345,6 +348,7 @@ int main(int argc, char* argv[]) {
     int schur_sample = 0;
     std::size_t limit = 0;
     bool resume = false;
+    bool export_final_pose = false;
     bool use_xyz = true;
     bool use_gcp_control = false;
     fs::path gcp_override;
@@ -385,6 +389,8 @@ int main(int argc, char* argv[]) {
             output_mode = BenchmarkOutputMode::CleanLogged;
         } else if (arg == "--resume") {
             resume = true;
+        } else if (arg == "--export-final-pose") {
+            export_final_pose = true;
         } else if (arg == "--no-xyz") {
             use_xyz = false;
         } else if (arg == "--use-gcp-control") {
@@ -427,6 +433,16 @@ int main(int argc, char* argv[]) {
         while (std::getline(existing_summary, line)) {
             if (!parse_summary_prefix(line, &fields) || fields[4] != "ok") {
                 continue;
+            }
+            // A successful legacy timing run may have no pose. Remove its
+            // row before rerunning, so a repaired resume keeps one row/key.
+            if (export_final_pose) {
+                const bool controlled = fields[3].find("-gcp-control") != std::string::npos;
+                const fs::path retained_pose = output_root / fields[0] / fields[1] /
+                    (fields[2] + (controlled ? "__gcp-control" : "")) / "FinalPose.txt";
+                if (!fs::is_regular_file(retained_pose) || fs::file_size(retained_pose) == 0) {
+                    continue;
+                }
             }
             const std::string key = run_key(fields[0], fields[1], fields[2], fields[3]);
             if (completed_runs.insert(key).second) {
@@ -471,22 +487,23 @@ int main(int argc, char* argv[]) {
                 use_gcp_control ? base_mode_name + "-gcp-control" : base_mode_name;
             const std::string key =
                 run_key(dataset.base_name, dataset.name, method_name, mode_name);
-            if (resume && completed_runs.find(key) != completed_runs.end()) {
-                ++skipped_runs;
-                continue;
-            }
-            ++attempted_runs;
             const bool diagnostics = output_mode == BenchmarkOutputMode::Diagnostic;
             const bool writes_run_files = output_mode != BenchmarkOutputMode::CleanTiming;
             const std::string run_leaf =
                 use_gcp_control ? method_name + "__gcp-control" : method_name;
             const fs::path run_dir = output_root / dataset.base_name / dataset.name / run_leaf;
-            if (writes_run_files) {
+            const fs::path pose = run_dir / "FinalPose.txt";
+            if (resume && completed_runs.find(key) != completed_runs.end() &&
+                (!export_final_pose || (fs::is_regular_file(pose) && fs::file_size(pose) > 0))) {
+                ++skipped_runs;
+                continue;
+            }
+            ++attempted_runs;
+            if (writes_run_files || export_final_pose) {
                 fs::create_directories(run_dir);
             }
 
             const fs::path report = run_dir / "report.txt";
-            const fs::path pose = run_dir / "FinalPose.txt";
             const fs::path points = run_dir / "Final3D.ply";
 
             const std::string cam_s = dataset.cam.string();
@@ -526,7 +543,7 @@ int main(int argc, char* argv[]) {
                                    use_xyz ? xyz_s.c_str() : nullptr,
                                    calib_s.c_str(),
                                    writes_run_files ? report_s.c_str() : nullptr,
-                                   diagnostics ? pose_s.c_str() : nullptr,
+                                   (diagnostics || export_final_pose) ? pose_s.c_str() : nullptr,
                                    diagnostics ? points_s.c_str() : nullptr,
                                    method,
                                    output_mode,

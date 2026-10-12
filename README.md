@@ -5,8 +5,8 @@ parameterizations in bundle adjustment. It exposes 14 parameterizations under
 one matched Ceres-based runner and separates clean timing runs from heavier
 diagnostic runs.
 
-This repository contains only the source code, benchmark driver, protocol
-notes, and the Initial Value analysis script. Large datasets, local build
+This repository contains the source code, benchmark driver, protocol notes,
+analysis tools, and a D144 reproduction runner. Large datasets, local build
 products, external reference material, and generated benchmark results are not
 versioned.
 
@@ -20,8 +20,12 @@ example_v2/
   example.cpp               command-line benchmark runner
 docs/
   benchmark_protocol.md     timing and diagnostic protocol notes
+  d144_reproduction.md      controlled D144 data, split, and execution protocol
+  d144_validation.md        publication validation and its scope
 tools/
   analyze_initial_value_benchmark.py
+  run_d144.py               D144 preparation, adjustment, and checkpoint evaluation
+  test_d144_runner.py       small controlled-network regression tests
 ```
 
 ## Implemented Methods
@@ -56,34 +60,35 @@ Frame suffixes:
 
 ## Dependencies
 
-The project is maintained as a Windows/MSVC CMake project. It uses:
+The maintained build uses Windows/MSVC. It requires:
 
-- CMake 3.10 or newer
+- CMake 3.21 or newer
 - C++17 compiler
-- Ceres Solver 2.3-compatible headers and libraries
-- Eigen
-- Sophus headers
-- vcpkg-installed transitive dependencies used by Ceres
-- optional NVIDIA cuDSS when the local Ceres build was configured with it
+- Ceres Solver 2.3 or newer, with a sparse linear algebra backend
+- Eigen 3.3 or newer
+- the dependencies required by the selected Ceres installation
 
-The CMake files keep local defaults but expose them as cache variables:
+Install these libraries separately. CMake resolves their installed package
+configurations; this project does not download dependencies. If they are not on
+CMake's search path, supply `Ceres_DIR` and `Eigen3_DIR`, or use
+`CMAKE_PREFIX_PATH`. For example, from the repository root:
 
 ```powershell
 cmake -S .\example_v2 -B .\example_v2\build `
-  -DCEP_THIRDPARTY_DIR="D:\deps\3rdparty" `
-  -DCEP_VCPKG_INSTALLED_DIR="D:\vcpkg\installed" `
-  -DCEP_VCPKG_TARGET_TRIPLET="x64-windows" `
-  -DCeres_DIR="D:\ceres-solver\install\lib\cmake\Ceres" `
-  -Dcudss_DIR="D:\NVIDIA cuDSS\v0.5\lib\12\cmake\cudss"
+  -DCeres_DIR="C:/deps/ceres/lib/cmake/Ceres" `
+  -DEigen3_DIR="C:/deps/eigen/share/eigen3/cmake"
 ```
 
-Omit `-Dcudss_DIR` if your Ceres build does not depend on cuDSS.
+Additional Ceres dependencies are resolved through `CeresConfig.cmake`. A Ceres
+build configured with optional dependencies such as cuDSS requires those
+packages to be discoverable as well.
+
+The D144 runner requires Python 3.10 or newer and NumPy. Analysis and plotting
+scripts additionally use pandas, SciPy, and Matplotlib.
 
 ## Build
 
 ```powershell
-cd E:\zuo\projects\CEP
-
 cmake -S .\example_v2 -B .\example_v2\build
 cmake --build .\example_v2\build --config Release
 ```
@@ -93,6 +98,10 @@ The executable is written to:
 ```text
 example_v2\build\Release\example.exe
 ```
+
+Configuring from the repository root is also supported with
+`cmake -S . -B build`; that build writes the executable to
+`build\example_v2\Release\example.exe`.
 
 ## Dataset Layout
 
@@ -167,6 +176,7 @@ prepared layout:
 example.exe [--problems <input-root>] [--out <results-root>]
             [--method <MethodId>] [--limit <N>] [--dataset <name>]
             [--mode clean|clean-logged|diagnostic] [--resume] [--no-xyz]
+            [--export-final-pose]
             [--point-condition-sample <N>] [--schur-sample <N>]
             [--use-gcp-control]
             [--gcp <gcp.txt>] [--gcp-observations <gcp_observations.txt>]
@@ -184,6 +194,7 @@ Important options:
   convergence and termination logs
 - `--mode diagnostic`: export reports, convergence, poses, point clouds, and sampled diagnostics
 - `--resume`: keep successful rows in an existing `summary.csv`, rerun failures, and skip completed runs
+- `--export-final-pose`: also export `FinalPose.txt` in clean or clean-logged mode, without enabling diagnostic output
 - `--no-xyz`: exclude `A0-XYZ-W`
 - `--point-condition-sample`: sample point-block conditioning diagnostics
 - `--schur-sample`: sample reduced camera Schur-system diagnostics
@@ -192,12 +203,16 @@ Important options:
 
 ## Clean Run
 
-Clean mode writes only `summary.csv` during the timed solve:
+Clean mode writes the aggregate `summary.csv` after each solve. Optional
+`--export-final-pose` writes camera poses after the timed Ceres solve:
 
 ```powershell
+$env:CEP_NUM_THREADS = "1"
+Remove-Item Env:CEP_STRICT_VECTOR_DIAGNOSTICS -ErrorAction SilentlyContinue
+
 .\example_v2\build\Release\example.exe `
-  --problems "E:\zuo\projects\CEP\BA Datasets" `
-  --out E:\zuo\projects\CEP\benchmark_initial_value_clean `
+  --problems ".\data\BA Datasets" `
+  --out .\runs\initial_value_clean `
   --mode clean `
   --resume
 ```
@@ -206,8 +221,8 @@ Smoke test one problem and one method:
 
 ```powershell
 .\example_v2\build\Release\example.exe `
-  --problems "E:\zuo\projects\CEP\BA Datasets" `
-  --out E:\zuo\projects\CEP\benchmark_smoke `
+  --problems ".\data\BA Datasets" `
+  --out .\runs\initial_value_smoke `
   --limit 1 `
   --method A2-Parallax-Mw `
   --mode clean
@@ -228,9 +243,12 @@ the raw Ceres termination message and full solver report, which can distinguish
 function, gradient, and parameter tolerance termination.
 
 ```powershell
+$env:CEP_NUM_THREADS = "1"
+Remove-Item Env:CEP_STRICT_VECTOR_DIAGNOSTICS -ErrorAction SilentlyContinue
+
 .\example_v2\build\Release\example.exe `
-  --problems "E:\zuo\projects\CEP\BA Datasets" `
-  --out E:\zuo\projects\CEP\benchmark_initial_value_clean_logged `
+  --problems ".\data\BA Datasets" `
+  --out .\runs\initial_value_clean_logged `
   --mode clean-logged `
   --resume
 ```
@@ -245,11 +263,11 @@ Diagnostic mode reruns the same problem-method pairs with extra outputs:
 
 ```powershell
 $env:CEP_STRICT_VECTOR_DIAGNOSTICS = "1"
-$env:CEP_NUM_THREADS = "4"
+$env:CEP_NUM_THREADS = "1"
 
 .\example_v2\build\Release\example.exe `
-  --problems "E:\zuo\projects\CEP\BA Datasets" `
-  --out E:\zuo\projects\CEP\benchmark_initial_value_diagnostic_strict `
+  --problems ".\data\BA Datasets" `
+  --out .\runs\initial_value_diagnostic_strict `
   --mode diagnostic `
   --resume `
   --point-condition-sample 128 `
@@ -278,13 +296,40 @@ Generate Initial Value aggregate tables:
 
 ```powershell
 python .\tools\analyze_initial_value_benchmark.py `
-  --summary E:\zuo\projects\CEP\benchmark_initial_value_clean\summary.csv `
-  --out E:\zuo\projects\CEP\benchmark_initial_value_clean\analysis
+  --summary .\runs\initial_value_clean\summary.csv `
+  --out .\runs\initial_value_clean\analysis
 ```
 
 The script expects `base_dataset` values in the form
 `<Category>__<Problem>`, which is what the runner emits for the native BA
 Datasets layout.
+
+## Controlled D144 Reproduction
+
+The D144 experiment uses one ground-controlled block, eight initialization
+quality sets, and the same 14 methods. Its data are distributed separately in
+the [PVL-BA-Bench catalogue](https://pub-2c28bdf6e62548919c47727a9b969dda.r2.dev/index.html),
+under `control_at_20` as
+`shiyan-problem-i2823-p188150-o1073331-g23-c0`.
+
+After downloading and extracting the block, run:
+
+```powershell
+python -m pip install numpy
+
+python .\tools\run_d144.py `
+  --problem-root ".\data\shiyan-problem-i2823-p188150-o1073331-g23-c0" `
+  --executable .\example_v2\build\Release\example.exe `
+  --out .\runs\d144_controlled
+```
+
+The runner creates the fixed 13-control/10-checkpoint split, uses one solver
+thread and the GCP datum, exports final camera poses, and evaluates held-out
+checkpoints by forward intersection without post-hoc Sim(3) alignment. A full
+run comprises 112 adjustments. Use `--prepare-only` to validate inputs and
+write the split without adjustment, or `--evaluate-only` to evaluate completed
+runs. See [D144 reproduction](docs/d144_reproduction.md) for download, selection,
+resume, output, and metric details.
 
 ## Protocol Notes
 

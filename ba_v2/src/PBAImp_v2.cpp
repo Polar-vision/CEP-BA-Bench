@@ -2095,7 +2095,7 @@ bool PBA::ba_run(char* szCam,
 		printf("%s %.12lf %s %.12lf\n", "RMSE(px):", initial_rmse, "to", final_rmse);
 	}
 
-	if (diagnostics && m_szCamePose != nullptr) {
+	if (m_szCamePose != nullptr) {
 		FILE* fp = nullptr;
 		fopen_s(&fp, m_szCamePose, "w");
 		if (fp != nullptr) {
